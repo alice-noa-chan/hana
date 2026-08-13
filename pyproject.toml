@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hana-llm-pipeline"
+version = "0.2.0"
+description = "Fail-closed, reusable decoder-only LLM research pipeline"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "numpy>=1.26",
+    "psutil>=5.9",
+    "PyYAML>=6.0",
+    "safetensors>=0.4.3",
+    "sentencepiece>=0.2.0",
+    "tensorboard>=2.16",
+    "torch>=2.3,<3",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2,<10",
+    "pytest-cov>=6,<8",
+    "ruff>=0.9,<1",
+]
+[project.scripts]
+hana = "llm_pipeline.cli:entrypoint"
+
+[tool.setuptools.packages.find]
+include = ["llm_pipeline*"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
