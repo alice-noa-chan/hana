@@ -41,18 +41,40 @@ def changes(**values: Any) -> Callable[[dict[str, Any]], None]:
     return mutate
 
 
+def remove(path: tuple[str, ...]) -> Callable[[dict[str, Any]], None]:
+    def mutate(config: dict[str, Any]) -> None:
+        target = config
+        for key in path[:-1]:
+            target = target[key]
+        target.pop(path[-1])
+
+    return mutate
+
+
 INVALID_CONFIGS: list[tuple[str, Callable[[dict[str, Any]], None], str]] = [
     ("schema", assign(("schema_version",), 1), "schema_version"),
     ("mode", assign(("run", "mode"), "bad"), "Unsupported run.mode"),
     ("sequence-empty", assign(("run", "sequence"), []), "non-empty list"),
     ("sequence-invalid", assign(("run", "sequence"), ["auto"]), "unsupported stages"),
     ("sequence-duplicate", assign(("run", "sequence"), ["pretrain", "pretrain"]), "duplicate"),
+    ("pack-mapping", assign(("data", "pack"), []), "data.pack must be a mapping"),
+    ("pack-name", assign(("data", "pack", "name"), ""), "data.pack.name"),
+    ("pack-version", assign(("data", "pack", "version"), True), "data.pack.version"),
+    ("pack-description", assign(("data", "pack", "description"), 3), "data.pack.description"),
+    ("pack-languages", assign(("data", "pack", "languages"), [" en"]), "data.pack.languages"),
+    ("pack-language-duplicate", assign(("data", "pack", "languages"), ["en", "EN"]), "duplicate"),
     ("format", assign(("data", "format"), "parquet"), "Unsupported data.format"),
     ("dataset", assign(("data", "dataset_type"), "eval"), "data.dataset_type"),
+    (
+        "require-all-sources",
+        assign(("data", "require_all_training_sources"), 1),
+        "require_all_training_sources",
+    ),
     ("chars", assign(("data", "min_chars"), -1), "min_chars/max_chars"),
     ("source-cap", assign(("data", "max_samples_per_source"), 0), "max_samples_per_source"),
     ("dedup", assign(("data", "dedup_backend"), "redis"), "dedup_backend"),
     ("shard", assign(("data", "token_cache_shard_size"), 0), "token_cache_shard_size"),
+    ("reasoning-field-name", assign(("data", "reasoning_field"), ""), "data.reasoning_field"),
     ("tokenizer", assign(("tokenizer", "type"), "other"), "sentencepiece"),
     ("tokenizer-model", assign(("tokenizer", "model_type"), "bad"), "model_type"),
     ("vocab", assign(("tokenizer", "vocab_size"), 0), "vocab_size"),
@@ -180,6 +202,16 @@ INVALID_CONFIGS: list[tuple[str, Callable[[dict[str, Any]], None], str]] = [
     ("truncation-policy", assign(("data", "truncation_policy"), "head"), "truncation_policy"),
     ("eval-batch", assign(("eval", "batch_size"), 0), "eval.batch_size"),
     ("eval-checkpoints", assign(("eval", "checkpoints"), []), "eval.checkpoints"),
+    (
+        "pilot-enabled-type",
+        assign(("eval", "knowledge_pilot", "enabled"), 1),
+        "knowledge_pilot.enabled",
+    ),
+    (
+        "pilot-file-path",
+        assign(("eval", "knowledge_pilot", "file"), ""),
+        "knowledge_pilot.file",
+    ),
     ("temperature", assign(("inference", "temperature"), -1), "temperature"),
     ("top-p", assign(("inference", "top_p"), 0), "top_p"),
     ("top-k", assign(("inference", "top_k"), -1), "top_k"),
@@ -192,6 +224,7 @@ INVALID_CONFIGS: list[tuple[str, Callable[[dict[str, Any]], None], str]] = [
     ("reject-temp", assign(("dpo", "generate_rejected", "temperature"), -1), "temperature/top_p"),
     ("reject-top-k", assign(("dpo", "generate_rejected", "top_k"), -1), "top_k/max_new_tokens"),
     ("reasoning", assign(("reasoning", "modes"), []), "reasoning.modes"),
+    ("reasoning-enabled", assign(("reasoning", "enabled"), 1), "reasoning.enabled"),
     (
         "reasoning-custom-mode",
         assign(("reasoning", "modes"), ["off", "brief"]),
@@ -218,6 +251,36 @@ INVALID_CONFIGS: list[tuple[str, Callable[[dict[str, Any]], None], str]] = [
         "mode_budget_ratios",
     ),
     (
+        "reasoning-ratios-missing",
+        remove(("reasoning", "mode_budget_ratios", "high")),
+        "mode_budget_ratios",
+    ),
+    (
+        "reasoning-off-ratio",
+        assign(("reasoning", "mode_budget_ratios", "off"), 0.1),
+        "mode_budget_ratios.off",
+    ),
+    (
+        "reasoning-instruction",
+        assign(("reasoning", "scratchpad_instruction"), ""),
+        "scratchpad_instruction",
+    ),
+    (
+        "reasoning-instruction-path",
+        assign(("reasoning", "scratchpad_instruction_file"), ""),
+        "scratchpad_instruction_file",
+    ),
+    (
+        "reasoning-expose-type",
+        assign(("reasoning", "expose_reasoning_trace"), 1),
+        "expose_reasoning_trace",
+    ),
+    (
+        "reasoning-special-token",
+        remove(("tokenizer", "special_tokens", "reasoning_high")),
+        "Missing special tokens",
+    ),
+    (
         "pilot-correct",
         assign(("eval", "knowledge_pilot", "required_correct"), 11),
         "required_correct",
@@ -228,11 +291,60 @@ INVALID_CONFIGS: list[tuple[str, Callable[[dict[str, Any]], None], str]] = [
         "item_count",
     ),
     (
+        "pilot-count-zero",
+        assign(("eval", "knowledge_pilot", "item_count"), 0),
+        "item_count must be positive",
+    ),
+    (
+        "pilot-correct-type",
+        assign(("eval", "knowledge_pilot", "required_correct"), 1.5),
+        "required_correct must be an integer",
+    ),
+    (
         "pilot-labels",
         assign(("eval", "knowledge_pilot", "choice_labels"), ["A", "A"]),
         "choice_labels",
     ),
+    (
+        "pilot-max-tokens-type",
+        assign(("eval", "knowledge_pilot", "max_new_tokens"), True),
+        "max_new_tokens must be an integer",
+    ),
+    (
+        "pilot-max-tokens-zero",
+        assign(("eval", "knowledge_pilot", "max_new_tokens"), 0),
+        "max_new_tokens must be positive",
+    ),
+    (
+        "pilot-coverage-type",
+        assign(("eval", "knowledge_pilot", "require_denylist_coverage"), 1),
+        "require_denylist_coverage",
+    ),
+    (
+        "pilot-coverage-disabled",
+        changes(
+            eval__knowledge_pilot__enabled=True,
+            eval__knowledge_pilot__file="private-pilot.jsonl",
+            eval__knowledge_pilot__require_denylist_coverage=False,
+        ),
+        "must remain true",
+    ),
+    (
+        "pilot-reasoning-mode",
+        assign(("eval", "knowledge_pilot", "reasoning_mode"), "unsupported"),
+        "knowledge_pilot.reasoning_mode",
+    ),
     ("policy-use", assign(("data_policy", "use_case"), "commercial"), "data_policy.use_case"),
+    (
+        "policy-audit-gate-type",
+        assign(("data_policy", "allow_audit_gated_sources"), 1),
+        "allow_audit_gated_sources",
+    ),
+    (
+        "policy-denylist-type",
+        assign(("data_policy", "require_benchmark_denylist"), 1),
+        "require_benchmark_denylist",
+    ),
     ("policy-hashes", assign(("data_policy", "max_rejection_hashes_per_source"), -1), "non-negative"),
 ]
 
@@ -253,15 +365,43 @@ SOURCE_CASES: list[tuple[str, Any, str]] = [
     ("not-list", {"unexpected": True}, "must be a list"),
     ("not-mapping", ["path"], "must be a mapping"),
     ("unknown", [{**base_source(), "mystery": True}], "unknown keys"),
+    ("missing-name", [{"path": "fixture.jsonl", "schema": "text", "split": "train"}], "name"),
+    ("duplicate-name", [base_source(), base_source()], "duplicate name"),
     ("both-paths", [{**base_source(), "paths": ["other"]}], "exactly one"),
     ("empty-paths", [{"name": "x", "paths": []}], "non-empty paths"),
     ("bad-path", [{"name": "x", "path": ""}], "non-empty path"),
     ("schema", [{**base_source(), "schema": "bad"}], "schema is unsupported"),
     ("split", [{**base_source(), "split": "dev"}], "split is unsupported"),
     ("cap", [{**base_source(), "max_samples": 0}], "max_samples"),
+    ("sample-rate-type", [{**base_source(), "sample_rate": True}], "sample_rate"),
+    ("sample-rate-range", [{**base_source(), "sample_rate": 2.0}], "sample_rate"),
+    ("languages", [{**base_source(), "languages": [""]}], "languages"),
+    ("language-duplicate", [{**base_source(), "languages": ["en", "EN"]}], "duplicates"),
+    ("language-field", [{**base_source(), "language_field": ""}], "language_field"),
+    ("reasoning-field", [{**base_source(), "reasoning_field": ""}], "reasoning_field"),
+    ("domain", [{**base_source(), "domain": ""}], "domain"),
     ("stages-empty", [{**base_source(), "stages": []}], "stages must be"),
+    ("stages-invalid", [{**base_source(), "stages": ["unknown"]}], "unsupported values"),
     ("stages-bad", [{**base_source(), "stages": ["eval"]}], "training source"),
     ("provenance", [{**base_source(), "provenance": "bad"}], "provenance must be"),
+    ("purpose", [{**base_source(), "purpose": "unknown"}], "purpose must be"),
+    (
+        "translation-field",
+        [{**base_source(), "schema": "translation", "target_lang_field": "target", "prompt_template": "{source_text}"}],
+        "source_lang_field",
+    ),
+    (
+        "translation-template",
+        [
+            {
+                **base_source(),
+                "schema": "translation",
+                "source_lang_field": "source",
+                "target_lang_field": "target",
+            }
+        ],
+        "prompt_template",
+    ),
 ]
 
 
