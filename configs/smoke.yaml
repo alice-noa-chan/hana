@@ -38,6 +38,8 @@ data:
   chosen_field: "chosen"
   rejected_field: "rejected"
   messages_field: "messages"
+  reasoning_field: "reasoning"
+  reasoning_mode_field: "reasoning_mode"
   normalize_nfkc: true
   dedup: true
   dedup_level: "sample"
@@ -204,6 +206,16 @@ reasoning:
   default_mode: "medium"
   modes: ["off", "low", "medium", "high"]
   max_reasoning_tokens: 64
+  mode_budget_ratios:
+    "off": 0.0
+    low: 0.25
+    medium: 0.5
+    high: 1.0
+  scratchpad_instruction: >-
+    Reason privately and produce a concise internal scratchpad. Do not write the final response
+    until the reasoning-off boundary appears. After that boundary, return only the final response
+    and do not quote or mention the scratchpad.
+  scratchpad_instruction_file: null
   expose_reasoning_trace: false
   save_reasoning_trace: false
 
@@ -275,6 +287,16 @@ eval:
     enabled: false
     n_turns: 2
     file: null
+  knowledge_pilot:
+    enabled: false
+    file: null
+    prompt_file: null
+    item_count: 10
+    required_correct: 10
+    choice_labels: ["A", "B", "C", "D"]
+    reasoning_mode: "high"
+    max_new_tokens: 8
+    require_denylist_coverage: true
   long_context:
     enabled: false
   checkpoints: ["latest", "best"]

@@ -114,6 +114,25 @@ def test_benchmark_components_are_found_inside_wrapped_samples(tmp_path: Path) -
     assert "benchmark_denylist" in sample_rejection_categories(wrapped, config)
 
 
+def test_private_reasoning_field_is_scanned_for_pii() -> None:
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    sample = SimpleNamespace(
+        text="<reasoning:high>\n<assistant>\ncontact child@example.com\n<reasoning:off>\nsafe answer",
+        kind="sft",
+        meta={
+            "messages": [
+                {
+                    "role": "assistant",
+                    "reasoning": "contact child@example.com",
+                    "content": "safe answer",
+                }
+            ]
+        },
+    )
+
+    assert "email" in sample_rejection_categories(sample, config, set())
+
+
 def test_required_benchmark_denylist_fails_closed(tmp_path: Path) -> None:
     config = copy.deepcopy(DEFAULT_CONFIG)
     config["data_policy"].update(

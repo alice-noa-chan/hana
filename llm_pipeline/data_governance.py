@@ -14,7 +14,7 @@ from .artifacts import atomic_write_json
 from .errors import DataPolicyError
 
 POLICY_VERSION = "internal-research-v3"
-FILTER_VERSION = "pii-benchmark-v2"
+FILTER_VERSION = "pii-benchmark-v3"
 ALLOWED_LICENSE_STATUSES = {"approved", "restricted_research"}
 ALLOWED_REVIEW_STATUSES = {"author_controlled", "filtered", "human_reviewed"}
 LICENSE_STATUSES = ALLOWED_LICENSE_STATUSES | {"review_required", "blocked"}

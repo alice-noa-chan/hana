@@ -30,6 +30,8 @@ PRESERVED_TAGS = {
     "<reasoning:high>",
     "<mask>",
 }
+REASONING_MODES = frozenset({"low", "medium", "high"})
+DEFAULT_REASONING_MODE = "medium"
 
 
 @dataclass
@@ -153,11 +155,21 @@ def iter_json_records(data: Any) -> Iterator[Any]:
     yield data
 
 
-def render_messages(messages: list[dict[str, Any]], special_tokens: dict[str, str]) -> tuple[str, list[int]]:
-    """Render chat messages and a character-level assistant-only loss mask."""
+def render_message_segments(
+    messages: list[dict[str, Any]],
+    special_tokens: dict[str, str],
+    normalize_nfkc: bool = True,
+    default_reasoning_mode: str = DEFAULT_REASONING_MODE,
+) -> list[tuple[str, bool]]:
+    """Render messages into text segments and assistant-loss flags.
 
-    parts: list[str] = []
-    mask: list[int] = []
+    An assistant message with a non-empty ``reasoning`` field places its
+    reasoning-mode control token before the assistant role cue.  The
+    reasoning-off token separates the private reasoning target from the final
+    answer target.  Messages without reasoning retain the original rendering.
+    """
+
+    segments: list[tuple[str, bool]] = []
     role_tokens = {
         "system": special_tokens.get("system", "<system>"),
         "user": special_tokens.get("user", "<user>"),
@@ -165,10 +177,48 @@ def render_messages(messages: list[dict[str, Any]], special_tokens: dict[str, st
     }
     for message in messages:
         role = str(message.get("role", "user")).lower()
-        content = escape_special_tokens(clean_text(message.get("content", "")), special_tokens)
-        rendered = f"{role_tokens.get(role, f'<{role}>')}\n{content}\n"
+        content = escape_special_tokens(
+            clean_text(message.get("content", ""), normalize_nfkc),
+            special_tokens,
+        )
+        role_token = role_tokens.get(role, f"<{role}>")
+        reasoning = ""
+        if role == "assistant":
+            reasoning = escape_special_tokens(
+                clean_text(message.get("reasoning", ""), normalize_nfkc),
+                special_tokens,
+            )
+        if reasoning:
+            requested_mode = str(message.get("reasoning_mode", default_reasoning_mode)).strip().lower()
+            if requested_mode not in REASONING_MODES:
+                raise ValueError(f"Unsupported reasoning_mode in assistant message: {requested_mode!r}.")
+            mode = requested_mode
+            reasoning_token = special_tokens.get(f"reasoning_{mode}", f"<reasoning:{mode}>")
+            reasoning_off = special_tokens.get("reasoning_off", "<reasoning:off>")
+            rendered = f"{reasoning_token}\n{role_token}\n{reasoning}\n{reasoning_off}\n{content}\n"
+        else:
+            rendered = f"{role_token}\n{content}\n"
+        segments.append((rendered, role == "assistant"))
+    return segments
+
+
+def render_messages(
+    messages: list[dict[str, Any]],
+    special_tokens: dict[str, str],
+    *,
+    default_reasoning_mode: str = DEFAULT_REASONING_MODE,
+) -> tuple[str, list[int]]:
+    """Render chat messages and a character-level assistant-only loss mask."""
+
+    parts: list[str] = []
+    mask: list[int] = []
+    for rendered, is_assistant in render_message_segments(
+        messages,
+        special_tokens,
+        default_reasoning_mode=default_reasoning_mode,
+    ):
         parts.append(rendered)
-        mask.extend([1 if role == "assistant" else 0] * len(rendered))
+        mask.extend([1 if is_assistant else 0] * len(rendered))
     return "".join(parts), mask
 
 
@@ -192,7 +242,16 @@ def normalize_messages(messages: Any) -> list[dict[str, str]]:
         raw_role = message.get("role", message.get("from", "user"))
         raw_content = message.get("content", message.get("value", message.get("text", "")))
         role = role_map.get(str(raw_role).lower(), str(raw_role).lower())
-        normalized.append({"role": role, "content": str(raw_content)})
+        normalized_message = {"role": role, "content": str(raw_content)}
+        if role == "assistant":
+            if "reasoning" in message:
+                normalized_message["reasoning"] = str(message.get("reasoning") or "")
+            if "reasoning_mode" in message:
+                requested_mode = str(message.get("reasoning_mode") or "").strip().lower()
+                if requested_mode not in REASONING_MODES:
+                    raise ValueError(f"Unsupported reasoning_mode in assistant message: {requested_mode!r}.")
+                normalized_message["reasoning_mode"] = requested_mode
+        normalized.append(normalized_message)
     return normalized
 
 

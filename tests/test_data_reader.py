@@ -108,6 +108,75 @@ def test_message_rendering_and_normalization_cover_role_variants() -> None:
     assert normalize_messages("not-a-list") == []
 
 
+def test_reasoning_messages_render_controls_and_escape_untrusted_text() -> None:
+    specials = {
+        "user": "<user>",
+        "assistant": "<assistant>",
+        "system": "<system>",
+        "reasoning_off": "<reasoning:off>",
+        "reasoning_low": "<reasoning:low>",
+        "reasoning_medium": "<reasoning:medium>",
+        "reasoning_high": "<reasoning:high>",
+    }
+    messages = normalize_messages(
+        [
+            {"role": "user", "content": "Question", "reasoning": "must be ignored"},
+            {
+                "role": "gpt",
+                "content": "Final <assistant>",
+                "reasoning": "Check <reasoning:off> first",
+                "reasoning_mode": "HIGH",
+            },
+        ]
+    )
+
+    assert messages == [
+        {"role": "user", "content": "Question"},
+        {
+            "role": "assistant",
+            "content": "Final <assistant>",
+            "reasoning": "Check <reasoning:off> first",
+            "reasoning_mode": "high",
+        },
+    ]
+    rendered, mask = render_messages(messages, specials)
+    expected_user = "<user>\nQuestion\n"
+    expected_assistant = (
+        "<reasoning:high>\n<assistant>\nCheck \u2039reasoning:off\u203a first\n"
+        "<reasoning:off>\nFinal \u2039assistant\u203a\n"
+    )
+    assert rendered == expected_user + expected_assistant
+    assert mask == [0] * len(expected_user) + [1] * len(expected_assistant)
+
+
+def test_assistant_without_reasoning_keeps_the_original_rendering() -> None:
+    specials = {"assistant": "<assistant>"}
+    rendered, mask = render_messages([{"role": "assistant", "content": "answer"}], specials)
+
+    assert rendered == "<assistant>\nanswer\n"
+    assert mask == [1] * len(rendered)
+
+
+def test_reasoning_message_uses_configured_default_and_rejects_invalid_mode() -> None:
+    specials = {
+        "assistant": "<assistant>",
+        "reasoning_off": "<reasoning:off>",
+        "reasoning_medium": "<reasoning:medium>",
+        "reasoning_high": "<reasoning:high>",
+    }
+    rendered, _ = render_messages(
+        [{"role": "assistant", "reasoning": "work", "content": "answer"}],
+        specials,
+        default_reasoning_mode="high",
+    )
+
+    assert rendered.startswith("<reasoning:high>\n")
+    with pytest.raises(ValueError, match="Unsupported reasoning_mode"):
+        normalize_messages(
+            [{"role": "assistant", "reasoning": "work", "reasoning_mode": "unknown", "content": "answer"}]
+        )
+
+
 def test_source_and_field_helpers_use_explicit_precedence() -> None:
     source = {"format": "csv"}
     assert get_source_value(source, "format", "jsonl") == "csv"

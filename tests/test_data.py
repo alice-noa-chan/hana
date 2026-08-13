@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier, local
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from llm_pipeline.config import load_config
 from llm_pipeline.data import (
+    _parallel_tokenization_worker_func,
     analyze_sample_stream,
     collate_token_batch,
     iter_deduped_samples,
@@ -19,6 +22,7 @@ from llm_pipeline.data import (
     row_to_text_sample,
     safe_perplexity,
     source_matches_stage,
+    split_key_for_sample,
     token_shard_cache_key,
     tokenize_training_samples,
 )
@@ -87,6 +91,23 @@ def test_token_cache_key_changes_when_audit_digest_changes(tmp_path: Path) -> No
     assert before != after
 
 
+def test_token_cache_key_changes_when_reasoning_fields_change(tmp_path: Path) -> None:
+    config = load_config(ROOT / "configs/smoke.yaml").mutable_copy()
+    source = tmp_path / "source.jsonl"
+    source.write_text('{"text":"synthetic training record"}\n', encoding="utf-8")
+    tokenizer_model = tmp_path / "tokenizer.model"
+    tokenizer_model.write_bytes(b"tokenizer")
+    config["data"]["sources"] = [{"name": "fixture", "path": str(source), "schema": "text"}]
+    tokenizer = FakeTokenizer()
+    tokenizer.model_path = tokenizer_model
+
+    before = token_shard_cache_key(config, tokenizer, "train", "sft", True)
+    config["data"]["reasoning_field"] = "private_work"
+    after = token_shard_cache_key(config, tokenizer, "train", "sft", True)
+
+    assert before != after
+
+
 def test_token_cache_publish_is_safe_for_concurrent_ddp_style_writers(tmp_path: Path) -> None:
     config = load_config(ROOT / "configs/smoke.yaml").mutable_copy()
     cache_dir = tmp_path / "token_cache"
@@ -149,6 +170,120 @@ def test_assistant_only_labels_and_packed_positions() -> None:
     collated = collate_token_batch(batch, pad_id=3)
     assert collated["position_ids"].tolist() == [[0, 1, 2, 0, 1, 2]]
     assert collated["document_ids"].tolist() == [[0, 0, 0, 1, 1, 1]]
+
+
+def test_instruction_source_maps_private_reasoning_fields() -> None:
+    config = load_config(ROOT / "configs/smoke.yaml").mutable_copy()
+    source = {
+        "schema": "instruction",
+        "reasoning_field": "private_work",
+        "reasoning_mode_field": "effort",
+    }
+
+    sample = row_to_text_sample(
+        {
+            "instruction": "Solve the synthetic task.",
+            "output": "Synthetic final answer.",
+            "private_work": "Synthetic intermediate steps.",
+            "effort": "high",
+        },
+        config,
+        dataset_type="sft",
+        source=source,
+    )
+
+    assert sample is not None
+    assistant = sample.meta["messages"][-1]
+    assert assistant["reasoning"] == "Synthetic intermediate steps."
+    assert assistant["reasoning_mode"] == "high"
+    assert "<reasoning:high>\n<assistant>" in sample.text
+    assert "<reasoning:off>\nSynthetic final answer." in sample.text
+    assert len(sample.labels_mask) == len(sample.text)
+
+
+def test_reasoning_variants_share_one_visible_conversation_split_key() -> None:
+    config = load_config(ROOT / "configs/smoke.yaml").mutable_copy()
+    source = {"schema": "instruction"}
+    first = row_to_text_sample(
+        {
+            "instruction": "Solve the synthetic task.",
+            "output": "Synthetic final answer.",
+            "reasoning": "First private derivation.",
+        },
+        config,
+        dataset_type="sft",
+        source=source,
+    )
+    second = row_to_text_sample(
+        {
+            "instruction": "Solve the synthetic task.",
+            "output": "Synthetic final answer.",
+            "reasoning": "Different private derivation.",
+        },
+        config,
+        dataset_type="sft",
+        source=source,
+    )
+
+    assert first is not None and second is not None
+    assert split_key_for_sample(first) == split_key_for_sample(second)
+
+
+def test_reasoning_sft_tokenization_matches_parallel_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = load_config(ROOT / "configs/smoke.yaml").mutable_copy()
+    config["data"]["token_cache_dir"] = None
+    config["data"]["sequence_packing"] = False
+    config["model"]["max_seq_len"] = 512
+    messages = [
+        {"role": "user", "content": "Question"},
+        {
+            "role": "assistant",
+            "content": "Final <assistant>",
+            "reasoning": "Check <reasoning:off>",
+            "reasoning_mode": "high",
+        },
+    ]
+    sample = TextSample("unused", kind="sft", meta={"messages": messages})
+    tokenizer = FakeTokenizer()
+
+    class FakeSentencePieceProcessor:
+        def __init__(self, model_file: str) -> None:
+            self.model_file = model_file
+
+        def encode(self, text: str, out_type: type[int]) -> list[int]:
+            assert out_type is int
+            return tokenizer.encode(text, add_special_tokens=False)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentencepiece",
+        SimpleNamespace(SentencePieceProcessor=FakeSentencePieceProcessor),
+    )
+    in_process = tokenize_training_samples([sample], tokenizer, config, assistant_only_loss=True)[0]
+    parallel_ids, parallel_labels = _parallel_tokenization_worker_func(
+        (
+            [(sample.text, sample.meta)],
+            str(tokenizer.model_path),
+            config["tokenizer"]["special_tokens"],
+            config["data"]["messages_field"],
+            config["data"]["normalize_nfkc"],
+            config["reasoning"]["default_mode"],
+            True,
+            config["model"]["max_seq_len"],
+            tokenizer.bos_id,
+            tokenizer.eos_id,
+        )
+    )[0]
+
+    assert in_process["input_ids"] == parallel_ids
+    assert in_process["labels"] == parallel_labels
+    reasoning_token_ids = tokenizer.encode("<reasoning:high>", add_special_tokens=False)
+    reasoning_start = next(
+        index
+        for index in range(len(parallel_ids))
+        if parallel_ids[index : index + len(reasoning_token_ids)] == reasoning_token_ids
+    )
+    assert parallel_labels[reasoning_start : reasoning_start + len(reasoning_token_ids)] == reasoning_token_ids
 
 
 def test_perplexity_is_finite_for_large_finite_loss() -> None:

@@ -80,6 +80,33 @@ sources:
       reviewed_at: "replace-with-review-time"
       evidence: "Describe parallel-text authorship and review evidence."
 
+  - name: "private_reasoning_sft_example"
+    path: "./train_data/reasoning_sft.local.jsonl"
+    schema: "instruction"
+    purpose: "training"
+    stages: ["sft"]
+    split: "all"
+    tokenizer: true
+    languages: ["en"]
+    domain: "reasoning"
+    instruction_field: "instruction"
+    input_field: "input"
+    output_field: "final_answer"
+    reasoning_field: "private_reasoning"
+    reasoning_mode_field: "reasoning_mode"
+    # Reasoning targets must be independently authored or licensed training
+    # material. Never derive them from held-out benchmark items.
+    provenance:
+      source_url: "internal://project/reasoning-sft"
+      revision: "replace-with-private-revision"
+      license_status: "approved"
+      allowed_uses: ["internal_noncommercial_research"]
+      pii_status: "author_controlled"
+      child_safety_status: "author_controlled"
+      reviewed_by: "replace-with-reviewer"
+      reviewed_at: "replace-with-review-time"
+      evidence: "Describe authorship, answer checks, and reasoning review evidence."
+
   # This entry demonstrates quarantine metadata. The generic evaluation stage
   # does not execute it automatically; a licensed suite needs an isolated evaluator.
   - name: "evaluation_only_example"

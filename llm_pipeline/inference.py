@@ -6,6 +6,7 @@ import json
 import math
 from collections.abc import Iterator
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -29,15 +30,37 @@ from .tokenizer import load_tokenizer
 from .training_runtime import choose_device, configure_torch_performance
 
 
-def apply_reasoning_control(prompt: str, config: dict[str, Any]) -> str:
-    """Prefix the prompt with the configured reasoning control token."""
+@dataclass(frozen=True)
+class GenerationResult:
+    """Final answer plus separately gated private reasoning metadata."""
+
+    answer: str
+    reasoning_mode: str
+    reasoning_tokens: int = 0
+    reasoning_trace: str | None = None
+
+
+@dataclass(frozen=True)
+class _DecodedPhase:
+    """Internal token-level result used to join reasoning and answer phases."""
+
+    text: str
+    input_ids: torch.Tensor
+    token_ids: tuple[int, ...]
+    trace: list[dict[str, Any]] | None
+
+
+def apply_reasoning_control(prompt: str, config: dict[str, Any], mode: str | None = None) -> str:
+    """Prefix one assistant cue with the configured reasoning control token."""
 
     reasoning = config["reasoning"]
     if not reasoning.get("enabled", True):
-        return f"{config['tokenizer']['special_tokens']['reasoning_off']}\n{prompt}"
-    mode = config["inference"].get("reasoning_mode") or reasoning["default_mode"]
+        return prompt
+    mode = mode or config["inference"].get("reasoning_mode") or reasoning["default_mode"]
     if mode not in reasoning["modes"]:
         raise ValueError(f"Unsupported reasoning mode '{mode}'. Expected {reasoning['modes']}")
+    if mode == "off":
+        return prompt
     token = config["tokenizer"]["special_tokens"][f"reasoning_{mode}"]
     return f"{token}\n{prompt}"
 
@@ -66,6 +89,7 @@ def build_inference_prompt(
     config: dict[str, Any],
     prompt: str,
     user_system_prompt: str | None = None,
+    reasoning_mode: str | None = None,
 ) -> str:
     """Render reasoning control, system prompts, user prompt, and assistant cue."""
 
@@ -95,8 +119,18 @@ def build_inference_prompt(
         messages.append({"role": "system", "content": user_system})
     messages.append({"role": "user", "content": prompt})
     rendered, _ = render_messages(messages, config["tokenizer"]["special_tokens"])
-    rendered = f"{rendered}{config['tokenizer']['special_tokens']['assistant']}\n"
-    return apply_reasoning_control(rendered, config)
+    assistant_cue = f"{config['tokenizer']['special_tokens']['assistant']}\n"
+    return f"{rendered}{apply_reasoning_control(assistant_cue, config, reasoning_mode)}"
+
+
+def reasoning_token_budget(config: dict[str, Any], mode: str) -> int:
+    """Return the bounded scratchpad budget for one configured reasoning mode."""
+
+    reasoning = config["reasoning"]
+    if not reasoning.get("enabled", True) or mode == "off":
+        return 0
+    ratio = float(reasoning["mode_budget_ratios"][mode])
+    return max(0, int(int(reasoning["max_reasoning_tokens"]) * ratio))
 
 
 class TextGenerator:
@@ -131,6 +165,7 @@ class TextGenerator:
             Path(config["experiments"]["output_dir"]) / "inference",
         )
         self._warning_count = 0
+        self._saved_reasoning_records: list[dict[str, Any]] = []
         if config["inference"].get("use_speculative_decoding"):
             logger.info(
                 "Speculative/MTP decoding requested but no verifier/draft engine is configured; "
@@ -160,22 +195,34 @@ class TextGenerator:
             self.logger.info("Further generation budget warnings suppressed.")
         self._warning_count += 1
 
-    def _encode_prompt(self, prompt: str, settings: dict[str, Any]) -> tuple[torch.Tensor, int]:
+    def _encode_prompt(
+        self,
+        prompt: str,
+        settings: dict[str, Any],
+        *,
+        reserve_new_tokens: int = 0,
+    ) -> tuple[torch.Tensor, int]:
         requested_new_tokens = max(0, int(settings["max_new_tokens"]))
+        reserve_new_tokens = max(0, int(reserve_new_tokens))
         position_limit = int(self.config["model"].get("max_position_embeddings", self.config["model"]["max_seq_len"]))
         if position_limit <= 0:
             raise ValueError("model.max_position_embeddings must be positive for inference.")
 
-        max_new_tokens = min(requested_new_tokens, max(0, position_limit - 1))
+        reserved = min(reserve_new_tokens, max(0, position_limit - 1))
+        max_new_tokens = min(requested_new_tokens, max(0, position_limit - 1 - reserved))
         if max_new_tokens < requested_new_tokens:
+            if settings.get("strict_context_fit", False):
+                raise RuntimeError("The prompt and requested generation budgets do not fit the model context window.")
             self._warn_limited(
                 f"Clamped max_new_tokens from {requested_new_tokens} to {max_new_tokens} "
                 f"to fit max_position_embeddings={position_limit}."
             )
-        prompt_budget = max(1, position_limit - max_new_tokens)
+        prompt_budget = max(1, position_limit - max_new_tokens - reserved)
 
         token_ids = [self.tokenizer.bos_id, *self.tokenizer.encode(prompt, add_special_tokens=False)]
         if len(token_ids) > prompt_budget:
+            if settings.get("strict_context_fit", False):
+                raise RuntimeError("The prompt and requested generation budgets do not fit the model context window.")
             original_len = len(token_ids)
             policy = str(self.config["data"].get("truncation_policy", "recent")).lower()
             if policy in {"recent", "tail", "left"} and prompt_budget > 1:
@@ -189,44 +236,61 @@ class TextGenerator:
         input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
         return input_ids, max_new_tokens
 
-    @torch.no_grad()
-    def generate(
+    def _decode(
         self,
-        prompt: str | None = None,
-        user_system_prompt: str | None = None,
-        generation_settings: dict[str, Any] | None = None,
-    ) -> str:
-        """Generate text from one prompt using KV-cache autoregressive decoding."""
+        rendered_prompt: str,
+        settings: dict[str, Any],
+        *,
+        phase: str,
+        allow_token_trace: bool,
+        reserve_new_tokens: int = 0,
+        allow_reasoning_boundary: bool = False,
+    ) -> _DecodedPhase:
+        """Decode one phase while keeping scratchpad and final traces separate."""
 
-        settings = {**self.config["inference"], **(generation_settings or {})}
-        prompt_text = clean_text(
-            prompt if prompt is not None else self.config["inference"]["prompt"],
-            self.config["data"]["normalize_nfkc"],
+        input_ids, max_new_tokens = self._encode_prompt(
+            rendered_prompt,
+            settings,
+            reserve_new_tokens=reserve_new_tokens,
         )
-        retrieved: list[dict[str, Any]] = []
-        query_embedding: list[float] | None = None
-        memory_context = ""
-        if self.memory is not None:
-            query_embedding = self._embed_text(prompt_text, "memory_query")
-            retrieved = self.memory.retrieve(query_embedding)
-            memory_context = self.memory.render(retrieved)
-        effective_user_system = "\n\n".join(part for part in (user_system_prompt or "", memory_context) if part)
-        rendered_prompt = build_inference_prompt(
-            self.config,
-            prompt_text,
-            user_system_prompt=effective_user_system or None,
+        return self._decode_from_ids(
+            input_ids,
+            max_new_tokens,
+            settings,
+            phase=phase,
+            allow_token_trace=allow_token_trace,
+            allow_reasoning_boundary=allow_reasoning_boundary,
         )
-        input_ids, max_new_tokens = self._encode_prompt(rendered_prompt, settings)
-        trace: list[dict[str, Any]] | None = [] if settings.get("token_trace_file") or self.memory is not None else None
-        suppress_ids = self.tokenizer.special_ids - {self.tokenizer.eos_id}
+
+    def _decode_from_ids(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        settings: dict[str, Any],
+        *,
+        phase: str,
+        allow_token_trace: bool,
+        allow_reasoning_boundary: bool = False,
+    ) -> _DecodedPhase:
+        """Decode from an existing token prefix without re-tokenizing it."""
+
+        position_limit = int(self.config["model"].get("max_position_embeddings", self.config["model"]["max_seq_len"]))
+        max_new_tokens = min(max(0, int(max_new_tokens)), max(0, position_limit - input_ids.size(1)))
+        trace: list[dict[str, Any]] | None = [] if allow_token_trace else None
+        allowed_special_ids = {self.tokenizer.eos_id}
+        generation_stop_id = self.tokenizer.eos_id
+        if allow_reasoning_boundary:
+            generation_stop_id = self.tokenizer.piece_to_id(self.config["tokenizer"]["special_tokens"]["reasoning_off"])
+            allowed_special_ids = {generation_stop_id}
+        suppress_ids = self.tokenizer.special_ids - allowed_special_ids
         if settings["generation_strategy"] == "hybrid":
-            self.activation_experiment.set_phase("hybrid_inference")
+            self.activation_experiment.set_phase(f"hybrid_{phase}")
             hybrid = self.config["hybrid_diffusion"]
             output = hybrid_generate(
                 self.model,
                 input_ids,
                 max_new_tokens=max_new_tokens,
-                eos_id=self.tokenizer.eos_id,
+                eos_id=generation_stop_id,
                 mask_id=self.tokenizer.mask_id,
                 block_size=int(hybrid["block_size"]),
                 denoise_steps=int(hybrid["denoise_steps"]),
@@ -239,11 +303,11 @@ class TextGenerator:
                 trace=trace,
             )
         else:
-            self.activation_experiment.set_phase("ar_inference")
+            self.activation_experiment.set_phase(f"ar_{phase}")
             output = self.model.generate(
                 input_ids,
                 max_new_tokens=max_new_tokens,
-                eos_id=self.tokenizer.eos_id,
+                eos_id=generation_stop_id,
                 temperature=float(settings["temperature"]),
                 top_p=float(settings["top_p"]),
                 top_k=int(settings["top_k"]),
@@ -252,22 +316,129 @@ class TextGenerator:
                 suppress_ids=suppress_ids,
                 trace=trace,
             )
+        generated_ids = output[0].tolist()[input_ids.size(1) :]
         if trace is not None:
             for record in trace:
                 ids = record.get("token_ids", [])
                 flat_ids = ids[0] if ids and isinstance(ids[0], list) else ids
                 record["token_pieces"] = [self.tokenizer.sp.id_to_piece(int(token_id)) for token_id in flat_ids]
-            if settings.get("token_trace_file"):
-                atomic_write_jsonl(settings["token_trace_file"], trace)
-        generated = self.tokenizer.decode(output[0].tolist()[input_ids.size(1) :])
-        if not self.config["reasoning"].get("expose_reasoning_trace", False):
-            for token in ("<reasoning>", "</reasoning>"):
-                generated = generated.replace(token, "")
-        generated = generated.strip()
+        return _DecodedPhase(
+            text=self.tokenizer.decode(generated_ids).strip(),
+            input_ids=input_ids,
+            token_ids=tuple(generated_ids),
+            trace=trace,
+        )
+
+    @torch.no_grad()
+    def generate_result(
+        self,
+        prompt: str | None = None,
+        user_system_prompt: str | None = None,
+        generation_settings: dict[str, Any] | None = None,
+    ) -> GenerationResult:
+        """Generate a hidden scratchpad first, then a separately decoded final answer."""
+
+        settings = {**self.config["inference"], **(generation_settings or {})}
+        prompt_text = clean_text(
+            prompt if prompt is not None else self.config["inference"]["prompt"],
+            self.config["data"]["normalize_nfkc"],
+        )
+        retrieved: list[dict[str, Any]] = []
+        memory_context = ""
+        if self.memory is not None:
+            query_embedding = self._embed_text(prompt_text, "memory_query")
+            retrieved = self.memory.retrieve(query_embedding)
+            memory_context = self.memory.render(retrieved)
+        effective_user_system = "\n\n".join(part for part in (user_system_prompt or "", memory_context) if part)
+        mode = settings.get("reasoning_mode") or self.config["reasoning"]["default_mode"]
+        if not self.config["reasoning"].get("enabled", True):
+            mode = "off"
+        if mode not in self.config["reasoning"]["modes"]:
+            raise ValueError(f"Unsupported reasoning mode '{mode}'. Expected {self.config['reasoning']['modes']}")
+
+        scratchpad = ""
+        scratchpad_ids: list[int] = []
+        budget = reasoning_token_budget(self.config, mode)
+        if mode != "off" and budget <= 0:
+            mode = "off"
+        final_phase: _DecodedPhase
+        if budget > 0:
+            scratchpad_instruction = (
+                read_prompt_file(self.config["reasoning"].get("scratchpad_instruction_file"))
+                or self.config["reasoning"]["scratchpad_instruction"]
+            )
+            scratchpad_system = "\n\n".join(part for part in (effective_user_system, scratchpad_instruction) if part)
+            reasoning_prompt = build_inference_prompt(
+                self.config,
+                prompt_text,
+                user_system_prompt=scratchpad_system or None,
+                reasoning_mode=mode,
+            )
+            reasoning_settings = {**settings, "max_new_tokens": budget, "token_trace_file": None}
+            boundary_token = self.config["tokenizer"]["special_tokens"]["reasoning_off"]
+            boundary_id = self.tokenizer.piece_to_id(boundary_token)
+            forced_boundary_ids = self.tokenizer.encode(
+                f"\n{boundary_token}\n",
+                add_special_tokens=False,
+            )
+            if forced_boundary_ids.count(boundary_id) != 1:
+                raise RuntimeError("Tokenizer did not encode exactly one reasoning-off boundary.")
+            requested_final_tokens = max(0, int(settings["max_new_tokens"]))
+            reasoning_phase = self._decode(
+                reasoning_prompt,
+                reasoning_settings,
+                phase="reasoning",
+                allow_token_trace=False,
+                reserve_new_tokens=len(forced_boundary_ids) + requested_final_tokens,
+                allow_reasoning_boundary=True,
+            )
+            generated_reasoning_ids = list(reasoning_phase.token_ids)
+            if boundary_id in generated_reasoning_ids:
+                boundary_index = generated_reasoning_ids.index(boundary_id)
+                scratchpad_ids = generated_reasoning_ids[:boundary_index]
+                continuation_ids = generated_reasoning_ids[: boundary_index + 1]
+            else:
+                scratchpad_ids = generated_reasoning_ids
+                continuation_ids = []
+            while scratchpad_ids and scratchpad_ids[-1] == self.tokenizer.eos_id:
+                scratchpad_ids.pop()
+            if not continuation_ids:
+                continuation_ids = [*scratchpad_ids, *forced_boundary_ids]
+            scratchpad = self.tokenizer.decode(scratchpad_ids).strip()
+            continuation_ids = torch.tensor(
+                [continuation_ids],
+                dtype=torch.long,
+                device=self.device,
+            )
+            final_input_ids = torch.cat((reasoning_phase.input_ids, continuation_ids), dim=1)
+            final_phase = self._decode_from_ids(
+                final_input_ids,
+                requested_final_tokens,
+                settings,
+                phase="inference",
+                allow_token_trace=bool(settings.get("token_trace_file") or self.memory is not None),
+            )
+        else:
+            final_prompt = build_inference_prompt(
+                self.config,
+                prompt_text,
+                user_system_prompt=effective_user_system or None,
+                reasoning_mode=mode,
+            )
+            final_phase = self._decode(
+                final_prompt,
+                settings,
+                phase="inference",
+                allow_token_trace=bool(settings.get("token_trace_file") or self.memory is not None),
+            )
+        if settings.get("token_trace_file") and final_phase.trace is not None:
+            atomic_write_jsonl(settings["token_trace_file"], final_phase.trace)
+
+        generated = final_phase.text.strip()
         if self.memory is not None and generated:
             entropies = [
                 float(value)
-                for record in trace or []
+                for record in final_phase.trace or []
                 for value in record.get("entropy", [])
                 if isinstance(value, (int, float))
             ]
@@ -280,7 +451,37 @@ class TextGenerator:
                 f"episodes={len(self.memory.state['episodes'])}, gists={len(self.memory.state['gists'])}."
             )
         self.activation_experiment.flush()
-        return generated
+        exposed = scratchpad if self.config["reasoning"].get("expose_reasoning_trace", False) else None
+        if scratchpad and self.config["reasoning"].get("save_reasoning_trace", False):
+            self._saved_reasoning_records.append(
+                {
+                    "reasoning_mode": mode,
+                    "reasoning_tokens": len(scratchpad_ids),
+                    "reasoning_trace": scratchpad,
+                }
+            )
+            atomic_write_jsonl(self.logger.log_dir / "reasoning_trace.jsonl", self._saved_reasoning_records)
+        return GenerationResult(
+            answer=generated,
+            reasoning_mode=mode,
+            reasoning_tokens=len(scratchpad_ids),
+            reasoning_trace=exposed,
+        )
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt: str | None = None,
+        user_system_prompt: str | None = None,
+        generation_settings: dict[str, Any] | None = None,
+    ) -> str:
+        """Generate a final answer while keeping any scratchpad private."""
+
+        return self.generate_result(
+            prompt=prompt,
+            user_system_prompt=user_system_prompt,
+            generation_settings=generation_settings,
+        ).answer
 
 
 def generate_text(
@@ -310,7 +511,8 @@ def run_inference(config: dict[str, Any], logger: Any) -> None:
                 break
             print(generator.generate(prompt=prompt))
     else:
-        output = generator.generate()
+        result = generator.generate_result()
+        output = result.answer
         minimum = int(config["inference"].get("min_output_chars", 1))
         if len(output) < minimum:
             raise RuntimeError(
@@ -322,10 +524,14 @@ def run_inference(config: dict[str, Any], logger: Any) -> None:
             "prompt": config["inference"]["prompt"],
             "output": output,
             "output_chars": len(output),
+            "reasoning_mode": result.reasoning_mode,
+            "reasoning_tokens": result.reasoning_tokens,
             "checkpoint": str(generator.checkpoint),
             "inference_fingerprint": inference_fingerprint(config, generator.checkpoint),
             "settings": config["inference"],
         }
+        if result.reasoning_trace is not None:
+            payload["reasoning_trace"] = result.reasoning_trace
         logger.log_dir.mkdir(parents=True, exist_ok=True)
         out_path = logger.log_dir / "inference.json"
         atomic_write_json(out_path, payload)

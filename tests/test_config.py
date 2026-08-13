@@ -135,6 +135,24 @@ def test_enabled_memory_evaluation_requires_a_private_file() -> None:
         validate_config(config)
 
 
+def test_enabled_knowledge_pilot_requires_a_private_file() -> None:
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config["eval"]["knowledge_pilot"]["enabled"] = True
+
+    with pytest.raises(ValueError, match=r"eval\.knowledge_pilot\.file"):
+        validate_config(config)
+
+
+def test_knowledge_pilot_cannot_share_a_training_path(tmp_path: Path) -> None:
+    shared = tmp_path / "shared.jsonl"
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config["data"]["train_file"] = str(shared)
+    config["eval"]["knowledge_pilot"]["file"] = str(shared)
+
+    with pytest.raises(ValueError, match="same file"):
+        validate_config(config)
+
+
 def test_loaded_config_is_deeply_immutable_and_local_overlay_has_precedence(tmp_path: Path) -> None:
     primary = tmp_path / "config.yaml"
     local = tmp_path / "local.yaml"

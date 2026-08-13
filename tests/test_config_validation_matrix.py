@@ -177,6 +177,7 @@ INVALID_CONFIGS: list[tuple[str, Callable[[dict[str, Any]], None], str]] = [
     ("save-interval", assign(("train", "save_interval_steps"), 0), "save_interval_steps"),
     ("vram", assign(("hardware", "target_vram_usage"), 0), "target_vram_usage"),
     ("workers", assign(("hardware", "num_workers"), -1), "num_workers"),
+    ("truncation-policy", assign(("data", "truncation_policy"), "head"), "truncation_policy"),
     ("eval-batch", assign(("eval", "batch_size"), 0), "eval.batch_size"),
     ("eval-checkpoints", assign(("eval", "checkpoints"), []), "eval.checkpoints"),
     ("temperature", assign(("inference", "temperature"), -1), "temperature"),
@@ -191,6 +192,46 @@ INVALID_CONFIGS: list[tuple[str, Callable[[dict[str, Any]], None], str]] = [
     ("reject-temp", assign(("dpo", "generate_rejected", "temperature"), -1), "temperature/top_p"),
     ("reject-top-k", assign(("dpo", "generate_rejected", "top_k"), -1), "top_k/max_new_tokens"),
     ("reasoning", assign(("reasoning", "modes"), []), "reasoning.modes"),
+    (
+        "reasoning-custom-mode",
+        assign(("reasoning", "modes"), ["off", "brief"]),
+        "reasoning.modes",
+    ),
+    (
+        "reasoning-budget",
+        assign(("reasoning", "max_reasoning_tokens"), -1),
+        "max_reasoning_tokens",
+    ),
+    (
+        "reasoning-budget-bool",
+        assign(("reasoning", "max_reasoning_tokens"), True),
+        "max_reasoning_tokens",
+    ),
+    (
+        "reasoning-mode",
+        assign(("inference", "reasoning_mode"), "unsupported"),
+        "inference.reasoning_mode",
+    ),
+    (
+        "reasoning-ratios",
+        assign(("reasoning", "mode_budget_ratios", "medium"), 2),
+        "mode_budget_ratios",
+    ),
+    (
+        "pilot-correct",
+        assign(("eval", "knowledge_pilot", "required_correct"), 11),
+        "required_correct",
+    ),
+    (
+        "pilot-count-bool",
+        assign(("eval", "knowledge_pilot", "item_count"), True),
+        "item_count",
+    ),
+    (
+        "pilot-labels",
+        assign(("eval", "knowledge_pilot", "choice_labels"), ["A", "A"]),
+        "choice_labels",
+    ),
     ("policy-use", assign(("data_policy", "use_case"), "commercial"), "data_policy.use_case"),
     ("policy-hashes", assign(("data_policy", "max_rejection_hashes_per_source"), -1), "non-negative"),
 ]
@@ -315,17 +356,38 @@ def test_redacted_artifact_removes_local_paths(tmp_path: Path) -> None:
     config = copy.deepcopy(DEFAULT_CONFIG)
     config.update(__config_path__=str(tmp_path / "config.yaml"), __base_dir__=str(tmp_path))
     config["data"]["sources"] = [base_source()]
+    config["data"]["pack"] = {"name": "private-pack", "version": 1, "languages": ["xx"]}
     config["dpo"]["train_file"] = "private.jsonl"
+    config["dpo"]["prompt_sources"] = ["private-source-name"]
     config["eval"]["instruction_file"] = "private-eval.jsonl"
     config["eval"]["multiturn_memory"]["file"] = "private-memory.jsonl"
+    config["eval"]["knowledge_pilot"]["file"] = "private-pilot.jsonl"
+    config["eval"]["knowledge_pilot"]["prompt_file"] = "private-prompt.txt"
     config["cognitive_architecture"]["memory"]["path"] = "private-memory.json"
+    config["reasoning"]["scratchpad_instruction_file"] = "private-reasoning.txt"
+    config["inference"]["model_system_prompt"] = "private model prompt"
+    config["inference"]["model_system_prompt_files"] = ["private-model.txt"]
+    config["inference"]["user_system_prompt"] = "private user prompt"
+    config["inference"]["user_system_prompt_file"] = "private-user.txt"
+    config["inference"]["prompt"] = "private user question"
 
     redacted = redacted_config_for_artifact(config)
     assert config_path(config) == tmp_path / "config.yaml"
     assert redacted["data"]["sources"] == "<redacted-local-data>"
+    assert redacted["data"]["pack"] == "<redacted-local-data-pack>"
     assert redacted["dpo"]["train_file"] == "<redacted-local-data>"
+    assert redacted["dpo"]["prompt_sources"] == "<redacted-local-source-names>"
     assert redacted["eval"]["instruction_file"] == "<redacted-local-data>"
+    assert redacted["eval"]["knowledge_pilot"]["file"] == "<redacted-local-data>"
+    assert redacted["eval"]["knowledge_pilot"]["prompt_file"] == "<redacted-local-data>"
     assert redacted["cognitive_architecture"]["memory"]["path"] == "<redacted-local-state>"
+    assert redacted["reasoning"]["scratchpad_instruction_file"] == "<redacted-local-prompt>"
+    assert redacted["reasoning"]["scratchpad_instruction"] == "<redacted-local-prompt>"
+    assert redacted["inference"]["model_system_prompt"] == "<redacted-local-prompt>"
+    assert redacted["inference"]["model_system_prompt_files"] == "<redacted-local-prompt-paths>"
+    assert redacted["inference"]["user_system_prompt"] == "<redacted-local-prompt>"
+    assert redacted["inference"]["user_system_prompt_file"] == "<redacted-local-prompt-paths>"
+    assert redacted["inference"]["prompt"] == "<redacted-local-prompt>"
 
     output = tmp_path / "artifact.yaml"
     save_redacted_config(output, config)

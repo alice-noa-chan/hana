@@ -64,6 +64,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "chosen_field": "chosen",
         "rejected_field": "rejected",
         "messages_field": "messages",
+        "reasoning_field": "reasoning",
+        "reasoning_mode_field": "reasoning_mode",
         "normalize_nfkc": True,
         "dedup": True,
         "dedup_level": "sample",
@@ -221,6 +223,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "default_mode": "medium",
         "modes": ["off", "low", "medium", "high"],
         "max_reasoning_tokens": 512,
+        "mode_budget_ratios": {"off": 0.0, "low": 0.25, "medium": 0.5, "high": 1.0},
+        "scratchpad_instruction": (
+            "Reason privately and produce a concise internal scratchpad. Do not write the final response "
+            "until the reasoning-off boundary appears. After that boundary, return only the final response "
+            "and do not quote or mention the scratchpad."
+        ),
+        "scratchpad_instruction_file": None,
         "expose_reasoning_trace": False,
         "save_reasoning_trace": False,
     },
@@ -300,6 +309,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "instruction_file": None,
         "long_context_file": None,
         "multiturn_memory": {"enabled": False, "n_turns": 10, "file": None},
+        "knowledge_pilot": {
+            "enabled": False,
+            "file": None,
+            "prompt_file": None,
+            "item_count": 10,
+            "required_correct": 10,
+            "choice_labels": ["A", "B", "C", "D"],
+            "reasoning_mode": "high",
+            "max_new_tokens": 8,
+            "require_denylist_coverage": True,
+        },
         "long_context": {"enabled": False},
         "checkpoints": ["latest", "best"],
     },
@@ -548,6 +568,9 @@ def resolve_config_paths(config: dict[str, Any], base_dir: Path) -> None:
     config["cognitive_architecture"]["memory"]["path"] = resolved(
         config["cognitive_architecture"]["memory"].get("path")
     )
+    config["reasoning"]["scratchpad_instruction_file"] = resolved(
+        config["reasoning"].get("scratchpad_instruction_file")
+    )
     for key in ("train_file", "valid_file", "test_file"):
         config["dpo"][key] = resolved(config["dpo"].get(key))
     for key in ("policy_model_path", "reference_model_path"):
@@ -556,6 +579,8 @@ def resolve_config_paths(config: dict[str, Any], base_dir: Path) -> None:
     for key in ("instruction_file", "long_context_file"):
         config["eval"][key] = resolved(config["eval"].get(key))
     config["eval"]["multiturn_memory"]["file"] = resolved(config["eval"]["multiturn_memory"].get("file"))
+    config["eval"]["knowledge_pilot"]["file"] = resolved(config["eval"]["knowledge_pilot"].get("file"))
+    config["eval"]["knowledge_pilot"]["prompt_file"] = resolved(config["eval"]["knowledge_pilot"].get("prompt_file"))
     config["inference"]["model_path"] = resolved(config["inference"].get("model_path"), allow_alias=True)
     config["inference"]["model_system_prompt_files"] = [
         resolved(value) for value in config["inference"].get("model_system_prompt_files", [])
@@ -711,8 +736,14 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("data.max_samples_per_source must be null or a positive integer.")
     if str(data.get("dedup_backend", "sqlite")).lower() not in {"memory", "sqlite"}:
         raise ValueError("data.dedup_backend must be 'memory' or 'sqlite'.")
+    if str(data.get("truncation_policy", "recent")).lower() not in {"recent", "tail", "left"}:
+        raise ValueError("data.truncation_policy must preserve recent tokens: recent, tail, or left.")
     if int(data.get("token_cache_shard_size", 4096)) <= 0:
         raise ValueError("data.token_cache_shard_size must be positive.")
+    for field_name in ("text_field", "messages_field", "reasoning_field", "reasoning_mode_field"):
+        field_value = data.get(field_name)
+        if not isinstance(field_value, str) or not field_value.strip():
+            raise ValueError(f"data.{field_name} must be a non-empty string.")
 
     sources = data.get("sources") or []
     if not isinstance(sources, list):
@@ -735,6 +766,8 @@ def validate_config(config: dict[str, Any]) -> None:
         "domain",
         "text_field",
         "messages_field",
+        "reasoning_field",
+        "reasoning_mode_field",
         "prompt_field",
         "chosen_field",
         "instruction_field",
@@ -814,6 +847,11 @@ def validate_config(config: dict[str, Any]) -> None:
             not isinstance(source["language_field"], str) or not source["language_field"].strip()
         ):
             raise ValueError(f"{label}.language_field must be a non-empty string.")
+        for field_name in ("reasoning_field", "reasoning_mode_field"):
+            if source.get(field_name) is not None and (
+                not isinstance(source[field_name], str) or not source[field_name].strip()
+            ):
+                raise ValueError(f"{label}.{field_name} must be a non-empty string.")
         if source.get("domain") is not None and (not isinstance(source["domain"], str) or not source["domain"].strip()):
             raise ValueError(f"{label}.domain must be a non-empty string.")
         stages = source.get("stages")
@@ -860,6 +898,23 @@ def validate_config(config: dict[str, Any]) -> None:
             )
             concrete_paths.update(os.path.normcase(os.path.realpath(match)) for match in matches)
         (evaluation_paths if purpose == "evaluation" else training_paths).update(concrete_paths)
+
+    for key in ("train_file", "valid_file", "test_file"):
+        value = data.get(key)
+        if value:
+            training_paths.add(os.path.normcase(os.path.realpath(value)))
+        dpo_value = config["dpo"].get(key)
+        if dpo_value:
+            training_paths.add(os.path.normcase(os.path.realpath(dpo_value)))
+    for value in (
+        config["eval"].get("instruction_file"),
+        config["eval"].get("long_context_file"),
+        config["eval"].get("multiturn_memory", {}).get("file"),
+        config["eval"].get("knowledge_pilot", {}).get("file"),
+        config["eval"].get("knowledge_pilot", {}).get("prompt_file"),
+    ):
+        if value:
+            evaluation_paths.add(os.path.normcase(os.path.realpath(value)))
 
     overlap = sorted(training_paths & evaluation_paths)
     if overlap:
@@ -1119,6 +1174,51 @@ def validate_config(config: dict[str, Any]) -> None:
     memory_eval = evaluation.get("multiturn_memory", {})
     if memory_eval.get("enabled", False) and not memory_eval.get("file"):
         raise ValueError("eval.multiturn_memory.file is required when multiturn memory evaluation is enabled.")
+    knowledge_pilot = evaluation.get("knowledge_pilot", {})
+    if not isinstance(knowledge_pilot.get("enabled", False), bool):
+        raise ValueError("eval.knowledge_pilot.enabled must be true or false.")
+    if knowledge_pilot.get("enabled", False) and not knowledge_pilot.get("file"):
+        raise ValueError("eval.knowledge_pilot.file is required when the knowledge pilot is enabled.")
+    for key in ("file", "prompt_file"):
+        value = knowledge_pilot.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(f"eval.knowledge_pilot.{key} must be a non-empty path or null.")
+    raw_item_count = knowledge_pilot.get("item_count", 10)
+    raw_required_correct = knowledge_pilot.get("required_correct", raw_item_count)
+    if isinstance(raw_item_count, bool) or not isinstance(raw_item_count, int):
+        raise ValueError("eval.knowledge_pilot.item_count must be an integer.")
+    if isinstance(raw_required_correct, bool) or not isinstance(raw_required_correct, int):
+        raise ValueError("eval.knowledge_pilot.required_correct must be an integer.")
+    item_count = raw_item_count
+    required_correct = raw_required_correct
+    if item_count <= 0:
+        raise ValueError("eval.knowledge_pilot.item_count must be positive.")
+    if not 0 <= required_correct <= item_count:
+        raise ValueError("eval.knowledge_pilot.required_correct must be between zero and item_count.")
+    choice_labels = knowledge_pilot.get("choice_labels")
+    if (
+        not isinstance(choice_labels, list)
+        or len(choice_labels) < 2
+        or len(choice_labels) != len(set(choice_labels))
+        or any(
+            not isinstance(label, str)
+            or len(label) != 1
+            or not label.isascii()
+            or not label.isalpha()
+            or label != label.upper()
+            for label in choice_labels
+        )
+    ):
+        raise ValueError("eval.knowledge_pilot.choice_labels must contain unique single-letter ASCII labels.")
+    raw_max_new_tokens = knowledge_pilot.get("max_new_tokens", 8)
+    if isinstance(raw_max_new_tokens, bool) or not isinstance(raw_max_new_tokens, int):
+        raise ValueError("eval.knowledge_pilot.max_new_tokens must be an integer.")
+    if raw_max_new_tokens <= 0:
+        raise ValueError("eval.knowledge_pilot.max_new_tokens must be positive.")
+    if not isinstance(knowledge_pilot.get("require_denylist_coverage", True), bool):
+        raise ValueError("eval.knowledge_pilot.require_denylist_coverage must be true or false.")
+    if knowledge_pilot.get("enabled", False) and not knowledge_pilot.get("require_denylist_coverage", True):
+        raise ValueError("eval.knowledge_pilot.require_denylist_coverage must remain true when the pilot is enabled.")
 
     inference = config["inference"]
     if inference.get("use_speculative_decoding", False):
@@ -1167,14 +1267,54 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("dpo.generate_rejected top_k/max_new_tokens settings are invalid.")
 
     reasoning = config["reasoning"]
+    if not isinstance(reasoning.get("enabled", True), bool):
+        raise ValueError("reasoning.enabled must be true or false.")
     modes_list = reasoning.get("modes")
-    if not isinstance(modes_list, list) or not modes_list or reasoning.get("default_mode") not in modes_list:
-        raise ValueError("reasoning.modes must include reasoning.default_mode.")
+    if (
+        not isinstance(modes_list, list)
+        or modes_list != ["off", "low", "medium", "high"]
+        or any(not isinstance(mode, str) or not mode.strip() for mode in modes_list)
+        or len(modes_list) != len(set(modes_list))
+        or reasoning.get("default_mode") not in modes_list
+    ):
+        raise ValueError("reasoning.modes must be exactly: off, low, medium, high, and include the default mode.")
     missing_reasoning_tokens = [
         value for value in modes_list if f"reasoning_{value}" not in tokenizer["special_tokens"]
     ]
     if missing_reasoning_tokens:
         raise ValueError(f"Missing special tokens for reasoning modes: {missing_reasoning_tokens}")
+    max_reasoning_tokens = reasoning.get("max_reasoning_tokens", 0)
+    if isinstance(max_reasoning_tokens, bool) or not isinstance(max_reasoning_tokens, int):
+        raise ValueError("reasoning.max_reasoning_tokens must be an integer.")
+    if max_reasoning_tokens < 0:
+        raise ValueError("reasoning.max_reasoning_tokens must be non-negative.")
+    budget_ratios = reasoning.get("mode_budget_ratios")
+    if not isinstance(budget_ratios, dict) or set(budget_ratios) != set(modes_list):
+        raise ValueError("reasoning.mode_budget_ratios must define every reasoning mode exactly once.")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or not 0 <= float(value) <= 1
+        for value in budget_ratios.values()
+    ):
+        raise ValueError("reasoning.mode_budget_ratios values must be finite numbers in [0, 1].")
+    if float(budget_ratios.get("off", -1)) != 0:
+        raise ValueError("reasoning.mode_budget_ratios.off must be zero.")
+    for key in ("scratchpad_instruction",):
+        value = reasoning.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"reasoning.{key} must be a non-empty string.")
+    reasoning_prompt = reasoning.get("scratchpad_instruction_file")
+    if reasoning_prompt is not None and (not isinstance(reasoning_prompt, str) or not reasoning_prompt.strip()):
+        raise ValueError("reasoning.scratchpad_instruction_file must be a non-empty path or null.")
+    for key in ("expose_reasoning_trace", "save_reasoning_trace"):
+        if not isinstance(reasoning.get(key), bool):
+            raise ValueError(f"reasoning.{key} must be true or false.")
+    if inference.get("reasoning_mode") not in modes_list:
+        raise ValueError("inference.reasoning_mode must be one of reasoning.modes.")
+    if knowledge_pilot.get("reasoning_mode") not in modes_list:
+        raise ValueError("eval.knowledge_pilot.reasoning_mode must be one of reasoning.modes.")
 
     quantization = config["quantization"]
     if str(quantization.get("method", "none")).lower() not in {"none", "int8"}:
@@ -1219,6 +1359,8 @@ def redacted_config_for_artifact(config: Mapping[str, Any]) -> dict[str, Any]:
             data_cfg[key] = "<redacted-local-data>"
     if "sources" in data_cfg:
         data_cfg["sources"] = "<redacted-local-data>"
+    if "pack" in data_cfg:
+        data_cfg["pack"] = "<redacted-local-data-pack>"
     data_cfg["data_provenance_redacted"] = True
     memory_cfg = redacted.get("cognitive_architecture", {}).get("memory", {})
     if "path" in memory_cfg:
@@ -1226,12 +1368,31 @@ def redacted_config_for_artifact(config: Mapping[str, Any]) -> dict[str, Any]:
     for key in ("train_file", "valid_file", "test_file"):
         if redacted.get("dpo", {}).get(key) is not None:
             redacted["dpo"][key] = "<redacted-local-data>"
+    if redacted.get("dpo", {}).get("prompt_sources"):
+        redacted["dpo"]["prompt_sources"] = "<redacted-local-source-names>"
     eval_cfg = redacted.get("eval", {})
     for key in ("instruction_file", "long_context_file"):
         if eval_cfg.get(key) is not None:
             eval_cfg[key] = "<redacted-local-data>"
     if eval_cfg.get("multiturn_memory", {}).get("file") is not None:
         eval_cfg["multiturn_memory"]["file"] = "<redacted-local-data>"
+    if eval_cfg.get("knowledge_pilot", {}).get("file") is not None:
+        eval_cfg["knowledge_pilot"]["file"] = "<redacted-local-data>"
+    if eval_cfg.get("knowledge_pilot", {}).get("prompt_file") is not None:
+        eval_cfg["knowledge_pilot"]["prompt_file"] = "<redacted-local-data>"
+    reasoning_cfg = redacted.get("reasoning", {})
+    if reasoning_cfg.get("scratchpad_instruction"):
+        reasoning_cfg["scratchpad_instruction"] = "<redacted-local-prompt>"
+    if reasoning_cfg.get("scratchpad_instruction_file") is not None:
+        reasoning_cfg["scratchpad_instruction_file"] = "<redacted-local-prompt>"
+    inference_cfg = redacted.get("inference", {})
+    for key in ("model_system_prompt", "user_system_prompt", "prompt"):
+        if inference_cfg.get(key):
+            inference_cfg[key] = "<redacted-local-prompt>"
+    for key in ("model_system_prompt_files", "user_system_prompt_file"):
+        value = inference_cfg.get(key)
+        if value:
+            inference_cfg[key] = "<redacted-local-prompt-paths>"
     return redacted
 
 

@@ -13,7 +13,7 @@ import shutil
 import statistics
 import sys
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -32,18 +32,31 @@ from .data_reader import (
     PreferenceSample,
     TextSample,
     clean_text,
-    escape_special_tokens,
     field_value,
     get_source_value,
     iter_rows,
     normalize_messages,
     read_rows,
+    render_message_segments,
     render_messages,
     stable_hash,
 )
 from .errors import DataPolicyError
 
 STATS_RESERVOIR_SIZE = 100_000
+
+
+def visible_messages_split_key(messages: list[dict[str, Any]]) -> str:
+    """Group alternate reasoning traces for the same visible conversation."""
+
+    visible = [
+        {
+            "role": str(message.get("role", "user")).lower(),
+            "content": clean_text(message.get("content", "")),
+        }
+        for message in messages
+    ]
+    return "messages:" + json.dumps(visible, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def instruction_to_messages(
@@ -66,7 +79,21 @@ def instruction_to_messages(
     if not instruction or not output:
         return None
     user_content = instruction if not input_text else f"{instruction}\n\n{input_text}"
-    return [{"role": "user", "content": user_content}, {"role": "assistant", "content": output}]
+    assistant: dict[str, str] = {"role": "assistant", "content": output}
+    reasoning = clean_text(
+        field_value(
+            row,
+            get_source_value(source, "reasoning_field", data_cfg["reasoning_field"]),
+        ),
+        data_cfg["normalize_nfkc"],
+    )
+    if reasoning:
+        assistant["reasoning"] = reasoning
+        mode_field = get_source_value(source, "reasoning_mode_field", data_cfg["reasoning_mode_field"])
+        mode = field_value(row, mode_field)
+        if mode is not None:
+            assistant["reasoning_mode"] = str(mode)
+    return [{"role": "user", "content": user_content}, assistant]
 
 
 def translation_to_sample(
@@ -114,11 +141,15 @@ def translation_to_sample(
             target_text=target_text,
         )
         messages = [{"role": "user", "content": user_content}, {"role": "assistant", "content": target_text}]
-        text, mask = render_messages(messages, config["tokenizer"]["special_tokens"])
+        text, mask = render_messages(
+            messages,
+            config["tokenizer"]["special_tokens"],
+            default_reasoning_mode=config["reasoning"]["default_mode"],
+        )
         return TextSample(
-            text=clean_text(text, data_cfg["normalize_nfkc"]),
+            text=text,
             kind="sft",
-            meta={**row, "messages": messages, **split_meta},
+            meta={**row, "messages": messages, "_split_key": visible_messages_split_key(messages), **split_meta},
             labels_mask=mask,
         )
     text = get_source_value(source, "text_template", "{source_lang}: {source_text}\n{target_lang}: {target_text}")
@@ -179,15 +210,34 @@ def row_to_text_sample(
         messages = instruction_to_messages(row, config, source)
         if not messages:
             return None
-        text, mask = render_messages(messages, tok_cfg["special_tokens"])
-        text = clean_text(text, data_cfg["normalize_nfkc"])
-        return TextSample(text=text, kind="sft", meta={**row, data_cfg["messages_field"]: messages}, labels_mask=mask)
+        text, mask = render_messages(
+            messages,
+            tok_cfg["special_tokens"],
+            default_reasoning_mode=config["reasoning"]["default_mode"],
+        )
+        return TextSample(
+            text=text,
+            kind="sft",
+            meta={
+                **row,
+                data_cfg["messages_field"]: messages,
+                "_split_key": visible_messages_split_key(messages),
+            },
+            labels_mask=mask,
+        )
 
     if messages_field in row:
         messages = normalize_messages(row.get(messages_field) or [])
-        text, mask = render_messages(messages, tok_cfg["special_tokens"])
-        text = clean_text(text, data_cfg["normalize_nfkc"])
-        meta = row if messages_field == data_cfg["messages_field"] else {**row, data_cfg["messages_field"]: messages}
+        text, mask = render_messages(
+            messages,
+            tok_cfg["special_tokens"],
+            default_reasoning_mode=config["reasoning"]["default_mode"],
+        )
+        meta = {
+            **row,
+            data_cfg["messages_field"]: messages,
+            "_split_key": visible_messages_split_key(messages),
+        }
         return TextSample(text=text, kind="sft", meta=meta, labels_mask=mask)
 
     if text_field in row:
@@ -734,6 +784,9 @@ def iter_tokenized_training_samples(
     bos_id = tokenizer.bos_id
     specials = config["tokenizer"]["special_tokens"]
 
+    def encode_without_specials(text: str) -> list[int]:
+        return list(tokenizer.encode(text, add_special_tokens=False))
+
     def has_loss_labels(labels: list[int]) -> bool:
         return any(label != -100 for label in labels[1:])
 
@@ -749,20 +802,16 @@ def iter_tokenized_training_samples(
     pending_seq_lens: list[int] = []
     for sample in samples:
         if assistant_only_loss and sample.meta and isinstance(sample.meta.get(config["data"]["messages_field"]), list):
-            ids = [bos_id]
-            labels = [-100]
             messages = sample.meta[config["data"]["messages_field"]]
-            for message in messages:
-                role = str(message.get("role", "user")).lower()
-                role_token = specials.get(role, f"<{role}>")
-                content = clean_text(message.get("content", ""), config["data"]["normalize_nfkc"])
-                content = escape_special_tokens(content, specials)
-                segment_text = f"{role_token}\n{content}\n"
-                segment_ids = tokenizer.encode(segment_text, add_special_tokens=False)
-                ids.extend(segment_ids)
-                labels.extend(segment_ids if role == "assistant" else [-100] * len(segment_ids))
-            ids.append(eos_id)
-            labels.append(eos_id if messages and messages[-1].get("role") == "assistant" else -100)
+            ids, labels = _tokenize_assistant_only_messages(
+                messages,
+                encode_without_specials,
+                specials,
+                config["data"]["normalize_nfkc"],
+                config["reasoning"]["default_mode"],
+                bos_id,
+                eos_id,
+            )
         else:
             ids = tokenizer.encode(sample.text, add_special_tokens=True)
             labels = list(ids)
@@ -806,7 +855,7 @@ def tokenize_training_samples(
         tokenizer_path = Path(str(getattr(tokenizer, "model_path", "")))
         tokenizer_stat = tokenizer_path.stat() if tokenizer_path.exists() else None
         cache_settings = {
-            "tokenization_version": 3,
+            "tokenization_version": 4,
             "assistant_only_loss": assistant_only_loss,
             "max_seq_len": max_seq_len,
             "sequence_packing": config["data"].get("sequence_packing", True),
@@ -1030,7 +1079,7 @@ def token_shard_cache_key(
         return str(value) if value else None
 
     payload = {
-        "version": 6,
+        "version": 7,
         "policy_version": POLICY_VERSION,
         "filter_version": FILTER_VERSION,
         "source_lock_digest": recorded_digest(policy_cfg.get("source_lock_path"), "lock_digest"),
@@ -1051,6 +1100,9 @@ def token_shard_cache_key(
         "dedup_level": config["data"].get("dedup_level"),
         "dedup_backend": config["data"].get("dedup_backend"),
         "truncation_policy": config["data"].get("truncation_policy"),
+        "messages_field": config["data"].get("messages_field"),
+        "reasoning_field": config["data"].get("reasoning_field"),
+        "reasoning_mode_field": config["data"].get("reasoning_mode_field"),
         "tokenizer_model": str(tokenizer_path),
         "tokenizer_model_size": tokenizer_stat.st_size if tokenizer_stat else None,
         "tokenizer_model_mtime_ns": tokenizer_stat.st_mtime_ns if tokenizer_stat else None,
@@ -1089,6 +1141,8 @@ def source_manifest_fingerprint(config: dict[str, Any], stage: str) -> str:
         "format": config["data"].get("format"),
         "text_field": config["data"].get("text_field"),
         "messages_field": config["data"].get("messages_field"),
+        "reasoning_field": config["data"].get("reasoning_field"),
+        "reasoning_mode_field": config["data"].get("reasoning_mode_field"),
         "normalize_nfkc": config["data"].get("normalize_nfkc"),
         "min_chars": config["data"].get("min_chars"),
         "max_chars": config["data"].get("max_chars"),
@@ -1145,6 +1199,34 @@ def iter_deduped_samples(
         conn.close()
 
 
+def _tokenize_assistant_only_messages(
+    messages: list[dict[str, Any]],
+    encode_without_specials: Callable[[str], list[int]],
+    special_tokens: dict[str, str],
+    normalize_nfkc: bool,
+    default_reasoning_mode: str,
+    bos_id: int,
+    eos_id: int,
+) -> tuple[list[int], list[int]]:
+    """Tokenize rendered chat segments with assistant-only loss labels."""
+
+    ids = [bos_id]
+    labels = [-100]
+    segments = render_message_segments(
+        messages,
+        special_tokens,
+        normalize_nfkc,
+        default_reasoning_mode,
+    )
+    for segment_text, is_assistant in segments:
+        segment_ids = list(encode_without_specials(segment_text))
+        ids.extend(segment_ids)
+        labels.extend(segment_ids if is_assistant else [-100] * len(segment_ids))
+    ids.append(eos_id)
+    labels.append(eos_id if segments and segments[-1][1] else -100)
+    return ids, labels
+
+
 def _parallel_tokenization_worker_func(args):
     """Worker process task for tokenizing a chunk of samples."""
     (
@@ -1153,6 +1235,7 @@ def _parallel_tokenization_worker_func(args):
         special_tokens,
         messages_field,
         normalize_nfkc,
+        default_reasoning_mode,
         assistant_only_loss,
         _max_seq_len,
         bos_id,
@@ -1162,22 +1245,22 @@ def _parallel_tokenization_worker_func(args):
 
     sp = spm.SentencePieceProcessor(model_file=tokenizer_path)
 
+    def encode_without_specials(text: str) -> list[int]:
+        return list(sp.encode(text, out_type=int))
+
     results = []
     for text, meta in samples_chunk_meta:
         if assistant_only_loss and meta and isinstance(meta.get(messages_field), list):
-            ids = [bos_id]
-            labels = [-100]
             messages = meta[messages_field]
-            for message in messages:
-                role = str(message.get("role", "user")).lower()
-                role_token = special_tokens.get(role, f"<{role}>")
-                content = escape_special_tokens(clean_text(message.get("content", ""), normalize_nfkc), special_tokens)
-                segment_text = f"{role_token}\n{content}\n"
-                segment_ids = list(sp.encode(segment_text, out_type=int))
-                ids.extend(segment_ids)
-                labels.extend(segment_ids if role == "assistant" else [-100] * len(segment_ids))
-            ids.append(eos_id)
-            labels.append(eos_id if messages and messages[-1].get("role") == "assistant" else -100)
+            ids, labels = _tokenize_assistant_only_messages(
+                messages,
+                encode_without_specials,
+                special_tokens,
+                normalize_nfkc,
+                default_reasoning_mode,
+                bos_id,
+                eos_id,
+            )
         else:
             ids = [bos_id, *list(sp.encode(text, out_type=int)), eos_id]
             labels = list(ids)
@@ -1236,6 +1319,7 @@ def build_token_shard_dataset(
     special_tokens = config["tokenizer"]["special_tokens"]
     messages_field = config["data"]["messages_field"]
     normalize_nfkc = config["data"]["normalize_nfkc"]
+    default_reasoning_mode = config["reasoning"]["default_mode"]
     max_seq_len = int(config["model"]["max_seq_len"])
     bos_id = tokenizer.bos_id
     eos_id = tokenizer.eos_id
@@ -1267,6 +1351,7 @@ def build_token_shard_dataset(
                 special_tokens,
                 messages_field,
                 normalize_nfkc,
+                default_reasoning_mode,
                 assistant_only_loss,
                 max_seq_len,
                 bos_id,
@@ -1280,6 +1365,7 @@ def build_token_shard_dataset(
                 special_tokens,
                 messages_field,
                 normalize_nfkc,
+                default_reasoning_mode,
                 assistant_only_loss,
                 max_seq_len,
                 bos_id,
