@@ -60,8 +60,12 @@ data:
 tokenizer:
   type: "sentencepiece"
   model_type: "bpe"
-  vocab_size: 1024
+  vocab_size: 512
   byte_fallback: true
+  split_digits: true
+  normalization_rule_name: "nmt_nfkc"
+  numeric_validation: true
+  numeric_validation_corpus_samples: 16
   character_coverage: 0.9995
   input_sentence_size: 10000000
   shuffle_input_sentence: true
@@ -79,11 +83,12 @@ tokenizer:
     reasoning_low: "<reasoning:low>"
     reasoning_medium: "<reasoning:medium>"
     reasoning_high: "<reasoning:high>"
+    reasoning_max: "<reasoning:max>"
     mask: "<mask>"
 
 model:
   architecture: "decoder_only"
-  vocab_size: 1024
+  vocab_size: 512
   hidden_size: 64
   num_layers: 2
   num_attention_heads: 4
@@ -102,6 +107,7 @@ model:
   sliding_window:
     enabled: false
     window_size: 128
+    layer_pattern: []
   dropout: 0.0
   attention_dropout: 0.0
   residual_dropout: 0.0
@@ -109,6 +115,9 @@ model:
   tie_embeddings: true
   use_bias: false
   gradient_checkpointing: false
+  qk_norm: true
+  attention_output_gate: false
+  attention_output_gate_bias: 2.0
 
 long_context_experimental:
   activation_beacon:
@@ -204,13 +213,25 @@ cognitive_architecture:
 reasoning:
   enabled: true
   default_mode: "medium"
-  modes: ["off", "low", "medium", "high"]
+  modes: ["off", "low", "medium", "high", "max"]
   max_reasoning_tokens: 64
   mode_budget_ratios:
     "off": 0.0
     low: 0.25
     medium: 0.5
-    high: 1.0
+    high: 0.75
+    max: 1.0
+  test_time_compute:
+    enabled: true
+    mode: "max"
+    # Two candidates keep the synthetic CPU smoke run inexpensive. The public
+    # full configuration uses three candidates.
+    candidates: 2
+    candidate_temperature: 1.0
+    candidate_top_p: 0.95
+    candidate_top_k: 20
+    selector_max_new_tokens: 4
+    selector_candidate_max_tokens: 16
   scratchpad_instruction: >-
     Reason privately and produce a concise internal scratchpad. Do not write the final response
     until the reasoning-off boundary appears. After that boundary, return only the final response
@@ -294,7 +315,7 @@ eval:
     item_count: 10
     required_correct: 10
     choice_labels: ["A", "B", "C", "D"]
-    reasoning_mode: "high"
+    reasoning_mode: "max"
     max_new_tokens: 8
     require_denylist_coverage: true
   long_context:

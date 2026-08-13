@@ -46,6 +46,18 @@ from .errors import DataPolicyError
 STATS_RESERVOIR_SIZE = 100_000
 
 
+def _file_sha256(path: Path) -> str | None:
+    """Hash a local artifact without retaining or logging any file content."""
+
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def visible_messages_split_key(messages: list[dict[str, Any]]) -> str:
     """Group alternate reasoning traces for the same visible conversation."""
 
@@ -853,15 +865,13 @@ def tokenize_training_samples(
         cache_dir = Path(cache_dir_value)
         cache_dir.mkdir(parents=True, exist_ok=True)
         tokenizer_path = Path(str(getattr(tokenizer, "model_path", "")))
-        tokenizer_stat = tokenizer_path.stat() if tokenizer_path.exists() else None
         cache_settings = {
-            "tokenization_version": 4,
+            "tokenization_version": 5,
             "assistant_only_loss": assistant_only_loss,
             "max_seq_len": max_seq_len,
             "sequence_packing": config["data"].get("sequence_packing", True),
             "tokenizer_model": str(tokenizer_path),
-            "tokenizer_model_size": tokenizer_stat.st_size if tokenizer_stat else None,
-            "tokenizer_model_mtime_ns": tokenizer_stat.st_mtime_ns if tokenizer_stat else None,
+            "tokenizer_model_sha256": _file_sha256(tokenizer_path),
             "tokenizer_vocab_size": getattr(tokenizer, "vocab_size", None),
             "special_tokens": config["tokenizer"]["special_tokens"],
         }
@@ -1051,7 +1061,6 @@ def token_shard_cache_key(
     """Build a cache key from source files, tokenizer, and tokenization settings."""
 
     tokenizer_path = Path(str(getattr(tokenizer, "model_path", "")))
-    tokenizer_stat = tokenizer_path.stat() if tokenizer_path.exists() else None
     sources_payload = []
     sources = config["data"].get("sources") or [{"path": config["data"]["train_file"], "schema": "auto"}]
     for source in sources:
@@ -1062,7 +1071,13 @@ def token_shard_cache_key(
             if not path.exists():
                 continue
             stat = path.stat()
-            expanded.append({"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+            expanded.append(
+                {
+                    "path": str(path),
+                    "size": stat.st_size,
+                    "sha256": _file_sha256(path),
+                }
+            )
         payload = dict(source)
         payload["expanded"] = expanded
         sources_payload.append(payload)
@@ -1079,7 +1094,7 @@ def token_shard_cache_key(
         return str(value) if value else None
 
     payload = {
-        "version": 7,
+        "version": 8,
         "policy_version": POLICY_VERSION,
         "filter_version": FILTER_VERSION,
         "source_lock_digest": recorded_digest(policy_cfg.get("source_lock_path"), "lock_digest"),
@@ -1104,8 +1119,7 @@ def token_shard_cache_key(
         "reasoning_field": config["data"].get("reasoning_field"),
         "reasoning_mode_field": config["data"].get("reasoning_mode_field"),
         "tokenizer_model": str(tokenizer_path),
-        "tokenizer_model_size": tokenizer_stat.st_size if tokenizer_stat else None,
-        "tokenizer_model_mtime_ns": tokenizer_stat.st_mtime_ns if tokenizer_stat else None,
+        "tokenizer_model_sha256": _file_sha256(tokenizer_path),
         "tokenizer_vocab_size": getattr(tokenizer, "vocab_size", None),
         "special_tokens": config["tokenizer"]["special_tokens"],
         "sources": sources_payload,
@@ -1130,7 +1144,7 @@ def source_manifest_fingerprint(config: dict[str, Any], stage: str) -> str:
             if not path.exists():
                 continue
             stat = path.stat()
-            expanded.append({"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+            expanded.append({"path": str(path), "size": stat.st_size, "sha256": _file_sha256(path)})
         payload = dict(source)
         payload["expanded"] = expanded
         sources_payload.append(payload)

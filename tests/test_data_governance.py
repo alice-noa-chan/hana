@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -418,6 +419,32 @@ def test_enforcement_requires_allowed_sources_and_fresh_audit(tmp_path: Path) ->
         enforce_data_policy(config, require_artifacts=True)
     audit_allowed_sources(config)
     assert enforce_data_policy(config, require_artifacts=True) == []
+
+
+def test_audit_authorization_rejects_same_size_same_mtime_source_tampering(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.jsonl"
+    source_path.write_bytes(b'{"text":"safe-one"}\n')
+    original_stat = source_path.stat()
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    approved = source_mapping()
+    approved["path"] = str(source_path)
+    config["data"]["sources"] = [approved]
+    config["data"]["min_chars"] = 0
+    config["data_policy"].update(
+        source_lock_path=str(tmp_path / "lock.json"),
+        audit_path=str(tmp_path / "audit.json"),
+    )
+    build_source_lock(config)
+    audit_allowed_sources(config)
+    assert enforce_data_policy(config, require_artifacts=True) == []
+
+    source_path.write_bytes(b'{"text":"safe-two"}\n')
+    os.utime(source_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    assert source_path.stat().st_size == original_stat.st_size
+    assert source_path.stat().st_mtime_ns == original_stat.st_mtime_ns
+    with pytest.raises(DataPolicyError, match="checksum changed"):
+        enforce_data_policy(config, require_artifacts=True)
 
 
 def test_benchmark_registry_change_invalidates_a_completed_audit(tmp_path: Path) -> None:

@@ -40,14 +40,18 @@ def local_runtime_config(tmp_path: Path) -> PipelineConfig:
 
 def test_doctor_reports_model_runtime_and_disk_without_cuda(tmp_path: Path, monkeypatch) -> None:
     config = local_runtime_config(tmp_path)
-    monkeypatch.setattr("llm_pipeline.tokenizer.load_tokenizer", lambda _config: SimpleNamespace(vocab_size=1024))
+    expected_vocab_size = int(config["tokenizer"]["vocab_size"])
+    monkeypatch.setattr(
+        "llm_pipeline.tokenizer.load_tokenizer",
+        lambda _config: SimpleNamespace(vocab_size=expected_vocab_size),
+    )
     monkeypatch.setattr("llm_pipeline.model.build_model", lambda _config: torch.nn.Linear(4, 4))
 
     report = build_doctor_report(config, allow_cpu=True)
 
     assert report["status"] == "ok"
     assert report["model"]["parameters"] == 20
-    assert report["model"]["tokenizer_vocab_size"] == 1024
+    assert report["model"]["tokenizer_vocab_size"] == expected_vocab_size
     assert report["runtime"]["free_disk_gib"] > 0
 
 

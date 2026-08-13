@@ -12,6 +12,7 @@ from llm_pipeline.data_governance import content_hash
 from llm_pipeline.tokenizer import (
     SentencePieceTokenizer,
     build_tokenizer_corpus_manifest,
+    sentencepiece_trainer_kwargs,
     verify_tokenizer_corpus_manifest,
 )
 
@@ -76,34 +77,9 @@ def test_reasoning_boundary_encoding_preserves_sentencepiece_separator(tmp_path:
         encoding="utf-8",
     )
     prefix = tmp_path / "tokenizer"
+    config["tokenizer"]["vocab_size"] = 300
     specials = config["tokenizer"]["special_tokens"]
-    user_defined = [
-        specials["user"],
-        specials["assistant"],
-        specials["system"],
-        specials["reasoning_off"],
-        specials["reasoning_low"],
-        specials["reasoning_medium"],
-        specials["reasoning_high"],
-        specials["mask"],
-    ]
-    spm.SentencePieceTrainer.train(
-        input=str(corpus),
-        model_prefix=str(prefix),
-        model_type="bpe",
-        vocab_size=300,
-        byte_fallback=True,
-        hard_vocab_limit=False,
-        unk_id=0,
-        bos_id=1,
-        eos_id=2,
-        pad_id=3,
-        pad_piece=specials["pad"],
-        unk_piece=specials["unk"],
-        bos_piece=specials["bos"],
-        eos_piece=specials["eos"],
-        user_defined_symbols=",".join(user_defined),
-    )
+    spm.SentencePieceTrainer.train(**sentencepiece_trainer_kwargs(config, input_path=corpus, model_prefix=prefix))
     tokenizer = SentencePieceTokenizer(prefix.with_suffix(".model"), specials)
     boundary_id = tokenizer.piece_to_id(specials["reasoning_off"])
 

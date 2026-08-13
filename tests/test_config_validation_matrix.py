@@ -78,6 +78,41 @@ INVALID_CONFIGS: list[tuple[str, Callable[[dict[str, Any]], None], str]] = [
     ("tokenizer", assign(("tokenizer", "type"), "other"), "sentencepiece"),
     ("tokenizer-model", assign(("tokenizer", "model_type"), "bad"), "model_type"),
     ("vocab", assign(("tokenizer", "vocab_size"), 0), "vocab_size"),
+    ("tokenizer-byte-fallback-type", assign(("tokenizer", "byte_fallback"), 1), "byte_fallback"),
+    ("tokenizer-byte-fallback-off", assign(("tokenizer", "byte_fallback"), False), "must remain true"),
+    ("tokenizer-split-digits-type", assign(("tokenizer", "split_digits"), 1), "split_digits"),
+    ("tokenizer-split-digits-off", assign(("tokenizer", "split_digits"), False), "must remain true"),
+    ("tokenizer-numeric-validation-off", assign(("tokenizer", "numeric_validation"), False), "must remain true"),
+    (
+        "tokenizer-normalizer",
+        assign(("tokenizer", "normalization_rule_name"), "unknown"),
+        "normalization_rule_name",
+    ),
+    (
+        "tokenizer-character-coverage",
+        assign(("tokenizer", "character_coverage"), 1.1),
+        "character_coverage",
+    ),
+    (
+        "tokenizer-character-coverage-below-sentencepiece-floor",
+        assign(("tokenizer", "character_coverage"), 0.97),
+        "character_coverage",
+    ),
+    (
+        "tokenizer-input-sentence-size",
+        assign(("tokenizer", "input_sentence_size"), True),
+        "input_sentence_size",
+    ),
+    (
+        "tokenizer-input-sentence-size-sentencepiece-reserved-range",
+        assign(("tokenizer", "input_sentence_size"), 100),
+        "input_sentence_size",
+    ),
+    (
+        "tokenizer-numeric-samples",
+        assign(("tokenizer", "numeric_validation_corpus_samples"), 0),
+        "numeric_validation_corpus_samples",
+    ),
     ("architecture", assign(("model", "architecture"), "encoder"), "architecture"),
     ("norm", assign(("model", "norm"), "layernorm"), "model.norm"),
     ("activation", assign(("model", "activation"), "relu"), "model.activation"),
@@ -94,6 +129,46 @@ INVALID_CONFIGS: list[tuple[str, Callable[[dict[str, Any]], None], str]] = [
     ("mha", changes(model__attention_type="mha", model__num_key_value_heads=1), "attention_type=mha"),
     ("mqa", changes(model__attention_type="mqa", model__num_key_value_heads=2), "attention_type=mqa"),
     ("layers", assign(("model", "num_layers"), 0), "num_layers"),
+    ("qk-norm-type", assign(("model", "qk_norm"), 1), "qk_norm"),
+    ("attention-output-gate-type", assign(("model", "attention_output_gate"), 1), "attention_output_gate"),
+    (
+        "attention-output-gate-bias",
+        assign(("model", "attention_output_gate_bias"), math.inf),
+        "attention_output_gate_bias",
+    ),
+    (
+        "attention-output-gate-needs-qk-norm",
+        changes(model__qk_norm=False, model__attention_output_gate=True),
+        "requires model.qk_norm=true",
+    ),
+    ("sliding-window-mapping", assign(("model", "sliding_window"), []), "sliding_window must be a mapping"),
+    ("sliding-window-enabled", assign(("model", "sliding_window", "enabled"), 1), "enabled must be"),
+    ("sliding-window-size", assign(("model", "sliding_window", "window_size"), 0), "positive integer"),
+    (
+        "sliding-window-limit",
+        changes(model__sliding_window__enabled=True, model__sliding_window__window_size=8192),
+        "must not exceed model.max_position_embeddings",
+    ),
+    (
+        "sliding-window-pattern-type",
+        assign(("model", "sliding_window", "layer_pattern"), "full"),
+        "layer_pattern must be a list",
+    ),
+    (
+        "sliding-window-pattern-value",
+        changes(model__sliding_window__enabled=True, model__sliding_window__layer_pattern=["full", "local"]),
+        "only full and sliding",
+    ),
+    (
+        "sliding-window-pattern-disabled",
+        assign(("model", "sliding_window", "layer_pattern"), ["full", "sliding"]),
+        "requires sliding_window.enabled=true",
+    ),
+    (
+        "sliding-window-pattern-not-hybrid",
+        changes(model__sliding_window__enabled=True, model__sliding_window__layer_pattern=["sliding"]),
+        "must contain both full and sliding",
+    ),
     ("dropout", assign(("model", "dropout"), 1), "model.dropout"),
     ("attention-dropout", assign(("model", "attention_dropout"), -0.1), "attention_dropout"),
     ("residual-dropout", assign(("model", "residual_dropout"), 1), "residual_dropout"),
@@ -261,6 +336,46 @@ INVALID_CONFIGS: list[tuple[str, Callable[[dict[str, Any]], None], str]] = [
         "mode_budget_ratios.off",
     ),
     (
+        "reasoning-ratios-order",
+        assign(("reasoning", "mode_budget_ratios", "high"), 0.4),
+        "increase from off through max",
+    ),
+    (
+        "reasoning-max-ratio",
+        assign(("reasoning", "mode_budget_ratios", "max"), 0.9),
+        "max must equal one",
+    ),
+    (
+        "reasoning-test-time-compute-type",
+        assign(("reasoning", "test_time_compute"), []),
+        "test_time_compute must be a mapping",
+    ),
+    (
+        "reasoning-test-time-compute-mode",
+        assign(("reasoning", "test_time_compute", "mode"), "high"),
+        "test_time_compute.mode",
+    ),
+    (
+        "reasoning-test-time-compute-candidates",
+        assign(("reasoning", "test_time_compute", "candidates"), 1),
+        "test_time_compute.candidates",
+    ),
+    (
+        "reasoning-test-time-compute-temperature",
+        assign(("reasoning", "test_time_compute", "candidate_temperature"), math.inf),
+        "candidate_temperature",
+    ),
+    (
+        "reasoning-test-time-compute-top-p",
+        assign(("reasoning", "test_time_compute", "candidate_top_p"), 0),
+        "candidate_top_p",
+    ),
+    (
+        "reasoning-test-time-compute-selector-budget",
+        assign(("reasoning", "test_time_compute", "selector_max_new_tokens"), 0),
+        "selector_max_new_tokens",
+    ),
+    (
         "reasoning-instruction",
         assign(("reasoning", "scratchpad_instruction"), ""),
         "scratchpad_instruction",
@@ -277,7 +392,7 @@ INVALID_CONFIGS: list[tuple[str, Callable[[dict[str, Any]], None], str]] = [
     ),
     (
         "reasoning-special-token",
-        remove(("tokenizer", "special_tokens", "reasoning_high")),
+        remove(("tokenizer", "special_tokens", "reasoning_max")),
         "Missing special tokens",
     ),
     (
@@ -510,6 +625,9 @@ def test_redacted_artifact_removes_local_paths(tmp_path: Path) -> None:
     config["inference"]["user_system_prompt"] = "private user prompt"
     config["inference"]["user_system_prompt_file"] = "private-user.txt"
     config["inference"]["prompt"] = "private user question"
+    config["data_policy"]["source_lock_path"] = "private-lock.json"
+    config["data_policy"]["audit_path"] = "private-audit.json"
+    config["data_policy"]["benchmark_denylist_path"] = "private-denylist.txt"
 
     redacted = redacted_config_for_artifact(config)
     assert config_path(config) == tmp_path / "config.yaml"
@@ -528,6 +646,9 @@ def test_redacted_artifact_removes_local_paths(tmp_path: Path) -> None:
     assert redacted["inference"]["user_system_prompt"] == "<redacted-local-prompt>"
     assert redacted["inference"]["user_system_prompt_file"] == "<redacted-local-prompt-paths>"
     assert redacted["inference"]["prompt"] == "<redacted-local-prompt>"
+    assert redacted["data_policy"]["source_lock_path"] == "<redacted-local-evidence>"
+    assert redacted["data_policy"]["audit_path"] == "<redacted-local-evidence>"
+    assert redacted["data_policy"]["benchmark_denylist_path"] == "<redacted-local-evidence>"
 
     output = tmp_path / "artifact.yaml"
     save_redacted_config(output, config)

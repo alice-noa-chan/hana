@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -21,6 +22,7 @@ from llm_pipeline.data import (
     load_preference_samples,
     row_to_text_sample,
     safe_perplexity,
+    source_manifest_fingerprint,
     source_matches_stage,
     split_key_for_sample,
     token_shard_cache_key,
@@ -106,6 +108,45 @@ def test_token_cache_key_changes_when_reasoning_fields_change(tmp_path: Path) ->
     after = token_shard_cache_key(config, tokenizer, "train", "sft", True)
 
     assert before != after
+
+
+def test_token_cache_key_tracks_tokenizer_bytes_not_only_file_metadata(tmp_path: Path) -> None:
+    config = load_config(ROOT / "configs/smoke.yaml").mutable_copy()
+    source = tmp_path / "source.jsonl"
+    source.write_text('{"text":"synthetic training record"}\n', encoding="utf-8")
+    tokenizer_model = tmp_path / "tokenizer.model"
+    tokenizer_model.write_bytes(b"token-one")
+    original_stat = tokenizer_model.stat()
+    config["data"]["sources"] = [{"name": "fixture", "path": str(source), "schema": "text"}]
+    tokenizer = FakeTokenizer()
+    tokenizer.model_path = tokenizer_model
+
+    before = token_shard_cache_key(config, tokenizer, "train", "pretrain", False)
+    tokenizer_model.write_bytes(b"token-two")
+    os.utime(tokenizer_model, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    assert tokenizer_model.stat().st_size == original_stat.st_size
+    assert tokenizer_model.stat().st_mtime_ns == original_stat.st_mtime_ns
+    assert token_shard_cache_key(config, tokenizer, "train", "pretrain", False) != before
+
+
+def test_token_cache_key_tracks_source_bytes_not_only_file_metadata(tmp_path: Path) -> None:
+    config = load_config(ROOT / "configs/smoke.yaml").mutable_copy()
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"text":"row-one"}\n')
+    original_stat = source.stat()
+    config["data"]["sources"] = [{"name": "fixture", "path": str(source), "schema": "text"}]
+    tokenizer = FakeTokenizer()
+
+    before = token_shard_cache_key(config, tokenizer, "train", "pretrain", False)
+    manifest_before = source_manifest_fingerprint(config, "pretrain")
+    source.write_bytes(b'{"text":"row-two"}\n')
+    os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    assert source.stat().st_size == original_stat.st_size
+    assert source.stat().st_mtime_ns == original_stat.st_mtime_ns
+    assert token_shard_cache_key(config, tokenizer, "train", "pretrain", False) != before
+    assert source_manifest_fingerprint(config, "pretrain") != manifest_before
 
 
 def test_token_cache_publish_is_safe_for_concurrent_ddp_style_writers(tmp_path: Path) -> None:

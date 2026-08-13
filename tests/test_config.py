@@ -16,8 +16,11 @@ def test_smoke_and_production_configs_are_valid() -> None:
     assert isinstance(loaded, PipelineConfig)
     assert loaded["run"]["experiment_name"] == "hana_llm_experiment"
     assert loaded["profile"]["assistant_label"] == "Hana"
+    assert loaded["reasoning"]["modes"] == ("off", "low", "medium", "high", "max")
+    assert loaded["reasoning"]["test_time_compute"]["mode"] == "max"
+    assert loaded["tokenizer"]["split_digits"] is True
     smoke = load_config(ROOT / "configs/smoke.yaml")
-    assert smoke["tokenizer"]["vocab_size"] == 1024
+    assert smoke["tokenizer"]["vocab_size"] == 512
     assert smoke["profile"]["id"] == "smoke_test"
 
 

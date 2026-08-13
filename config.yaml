@@ -72,6 +72,12 @@ tokenizer:
   model_type: "bpe"
   vocab_size: 32000
   byte_fallback: true
+  # Decimal digits are individual tokens so number copying and arithmetic do
+  # not depend on which multi-digit chunks happened to enter the vocabulary.
+  split_digits: true
+  normalization_rule_name: "nmt_nfkc"
+  numeric_validation: true
+  numeric_validation_corpus_samples: 256
   character_coverage: 0.9995
   # This conservative default still needs measurement on the operator's hardware.
   input_sentence_size: 500000
@@ -90,6 +96,7 @@ tokenizer:
     reasoning_low: "<reasoning:low>"
     reasoning_medium: "<reasoning:medium>"
     reasoning_high: "<reasoning:high>"
+    reasoning_max: "<reasoning:max>"
     mask: "<mask>"
 
 model:
@@ -116,6 +123,9 @@ model:
   sliding_window:
     enabled: false
     window_size: 1024
+    # Leave empty for the original all-sliding behavior when enabled. A
+    # controlled hybrid experiment may use [full, sliding, sliding, sliding].
+    layer_pattern: []
   dropout: 0.0
   attention_dropout: 0.0
   residual_dropout: 0.0
@@ -124,8 +134,12 @@ model:
   use_bias: false
   # true / false / "auto" (auto enables only for large models)
   gradient_checkpointing: true
-  # QK-norm, logit soft-capping, and init std improve large-model stability.
-  qk_norm: false
+  # QK normalization is part of the published baseline. The head-specific
+  # attention output gate remains an unverified, opt-in architecture study.
+  qk_norm: true
+  attention_output_gate: false
+  # Zero gate weights and this positive bias start an enabled gate near one.
+  attention_output_gate_bias: 2.0
   logit_softcap: 0.0
   initializer_range: 0.02
 
@@ -231,15 +245,27 @@ cognitive_architecture:
 reasoning:
   enabled: true
   default_mode: "medium"
-  modes: ["off", "low", "medium", "high"]
-  max_reasoning_tokens: 512
+  modes: ["off", "low", "medium", "high", "max"]
+  max_reasoning_tokens: 1024
   # Each mode receives a fraction of max_reasoning_tokens. The scratchpad is
   # generated privately before the final answer and is hidden by default.
   mode_budget_ratios:
     "off": 0.0
     low: 0.25
     medium: 0.5
-    high: 1.0
+    high: 0.75
+    max: 1.0
+  # Max effort generates several independently sampled solutions. A strict
+  # majority wins; otherwise a private selector sees final answers only.
+  test_time_compute:
+    enabled: true
+    mode: "max"
+    candidates: 3
+    candidate_temperature: 1.0
+    candidate_top_p: 0.95
+    candidate_top_k: 50
+    selector_max_new_tokens: 8
+    selector_candidate_max_tokens: 256
   scratchpad_instruction: >-
     Reason privately and produce a concise internal scratchpad. Do not write the final response
     until the reasoning-off boundary appears. After that boundary, return only the final response
@@ -351,7 +377,7 @@ eval:
     item_count: 10
     required_correct: 10
     choice_labels: ["A", "B", "C", "D"]
-    reasoning_mode: "high"
+    reasoning_mode: "max"
     max_new_tokens: 8
     require_denylist_coverage: true
   long_context:

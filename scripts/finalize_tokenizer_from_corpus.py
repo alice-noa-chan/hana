@@ -14,7 +14,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from llm_pipeline.config import load_config  # noqa: E402
 from llm_pipeline.data import save_json  # noqa: E402
-from llm_pipeline.tokenizer import SentencePieceTokenizer, verify_tokenizer_corpus_manifest  # noqa: E402
+from llm_pipeline.tokenizer import (  # noqa: E402
+    SentencePieceTokenizer,
+    publish_tokenizer_bundle,
+    sentencepiece_trainer_kwargs,
+    validate_tokenizer_candidate,
+    verify_tokenizer_corpus_manifest,
+)
 
 
 def main() -> None:
@@ -37,65 +43,43 @@ def main() -> None:
         raise RuntimeError("Install requirements.txt before finalizing the tokenizer.") from exc
 
     specials = tok_cfg["special_tokens"]
-    user_defined = [
-        specials["user"],
-        specials["assistant"],
-        specials["system"],
-        specials["reasoning_off"],
-        specials["reasoning_low"],
-        specials["reasoning_medium"],
-        specials["reasoning_high"],
-        specials["mask"],
-    ]
     with tempfile.TemporaryDirectory(prefix="tokenizer-finalize-", dir=save_dir) as temporary:
         prefix = Path(temporary) / "tokenizer"
         spm.SentencePieceTrainer.train(
-            input=str(corpus),
-            model_prefix=str(prefix),
-            model_type=tok_cfg["model_type"],
-            vocab_size=int(tok_cfg["vocab_size"]),
-            character_coverage=float(tok_cfg["character_coverage"]),
-            input_sentence_size=int(tok_cfg["input_sentence_size"]),
-            shuffle_input_sentence=bool(tok_cfg["shuffle_input_sentence"]),
-            byte_fallback=bool(tok_cfg["byte_fallback"]),
-            hard_vocab_limit=False,
-            num_threads=max(1, os.cpu_count() or 1),
-            unk_id=0,
-            bos_id=1,
-            eos_id=2,
-            pad_id=3,
-            pad_piece=specials["pad"],
-            unk_piece=specials["unk"],
-            bos_piece=specials["bos"],
-            eos_piece=specials["eos"],
-            user_defined_symbols=",".join(user_defined),
+            **sentencepiece_trainer_kwargs(
+                config,
+                input_path=corpus,
+                model_prefix=prefix,
+                num_threads=max(1, os.cpu_count() or 1),
+            )
         )
         candidate = SentencePieceTokenizer(prefix.with_suffix(".model"), specials)
         if candidate.vocab_size != int(tok_cfg["vocab_size"]):
             raise RuntimeError(
                 f"Tokenizer produced vocab_size={candidate.vocab_size}, expected {tok_cfg['vocab_size']}."
             )
-        prefix.with_suffix(".model").replace(save_dir / "tokenizer.model")
-        prefix.with_suffix(".vocab").replace(save_dir / "tokenizer.vocab")
-
-    tokenizer = SentencePieceTokenizer(save_dir / "tokenizer.model", specials)
-    tokenizer.save_metadata(save_dir, config)
+        validation = validate_tokenizer_candidate(candidate, config, corpus)
+        tokenizer = publish_tokenizer_bundle(
+            candidate,
+            config,
+            validation,
+            save_dir,
+            vocab_path=prefix.with_suffix(".vocab"),
+        )
     corpus_manifest.update(
         input_sentence_size=int(tok_cfg["input_sentence_size"]),
         vocab_size=tokenizer.vocab_size,
         finalized_from_existing_corpus=True,
     )
     save_json(save_dir / "corpus_manifest.json", corpus_manifest)
-    with corpus.open("r", encoding="utf-8") as handle:
-        probe = next((line.strip() for line in handle if line.strip()), "")
-    if not probe:
-        raise RuntimeError("Tokenizer corpus has no non-empty round-trip probe row.")
-    encoded = tokenizer.encode(probe)
-    decoded = tokenizer.decode(encoded)
-    if not decoded:
-        raise RuntimeError("Tokenizer round-trip probe decoded to an empty string.")
     print(f"Tokenizer ready: vocab={tokenizer.vocab_size:,}, corpus_bytes={corpus.stat().st_size:,}")
-    print(f"Round-trip: {decoded}")
+    print(
+        "Validation passed: "
+        f"probes={validation['probe_count']}, "
+        f"corpus_samples={validation['corpus_samples_checked']}, "
+        f"unknown_tokens={validation['unk_count']}, "
+        f"model_sha256={validation['model_sha256']}"
+    )
 
 
 if __name__ == "__main__":

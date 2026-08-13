@@ -479,7 +479,10 @@ def audit_allowed_sources(config: dict[str, Any], output_path: str | Path | None
 def load_and_verify_data_audit(config: dict[str, Any], lock: dict[str, Any] | None = None) -> dict[str, Any]:
     """Load a complete audit and verify every input that gives it meaning."""
 
-    source_lock = lock or load_and_verify_source_lock(config)
+    # An audit authorizes the locked bytes, not merely their paths and cheap
+    # filesystem metadata. Re-hash here so same-size, restored-mtime edits can
+    # never reuse an earlier audit.
+    source_lock = lock or load_and_verify_source_lock(config, verify_hashes=True)
     audit_path = Path(config["data_policy"]["audit_path"])
     try:
         audit = json.loads(audit_path.read_text(encoding="utf-8"))
@@ -515,7 +518,7 @@ def enforce_data_policy(config: dict[str, Any], *, require_artifacts: bool) -> l
     if not allowed:
         raise DataPolicyError("No approved source remains under the internal research policy.")
     if require_artifacts:
-        lock = load_and_verify_source_lock(config)
+        lock = load_and_verify_source_lock(config, verify_hashes=True)
         load_and_verify_data_audit(config, lock)
     config["data"]["sources"] = allowed
     return excluded

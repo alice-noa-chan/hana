@@ -93,6 +93,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "model_type": "bpe",
         "vocab_size": 32000,
         "byte_fallback": True,
+        "split_digits": True,
+        "normalization_rule_name": "nmt_nfkc",
+        "numeric_validation": True,
+        "numeric_validation_corpus_samples": 256,
         "character_coverage": 0.9995,
         "input_sentence_size": 10000000,
         "shuffle_input_sentence": True,
@@ -110,6 +114,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "reasoning_low": "<reasoning:low>",
             "reasoning_medium": "<reasoning:medium>",
             "reasoning_high": "<reasoning:high>",
+            "reasoning_max": "<reasoning:max>",
             "mask": "<mask>",
         },
     },
@@ -129,7 +134,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "activation": "swiglu",
         "attention_type": "gqa",
         "attention_backend": "auto",
-        "sliding_window": {"enabled": False, "window_size": 4096},
+        "sliding_window": {"enabled": False, "window_size": 4096, "layer_pattern": []},
         "dropout": 0.0,
         "attention_dropout": 0.0,
         "residual_dropout": 0.0,
@@ -137,7 +142,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "tie_embeddings": True,
         "use_bias": False,
         "gradient_checkpointing": "auto",
-        "qk_norm": False,
+        "qk_norm": True,
+        "attention_output_gate": False,
+        "attention_output_gate_bias": 2.0,
         "logit_softcap": 0.0,
         "initializer_range": 0.02,
     },
@@ -221,9 +228,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "reasoning": {
         "enabled": True,
         "default_mode": "medium",
-        "modes": ["off", "low", "medium", "high"],
-        "max_reasoning_tokens": 512,
-        "mode_budget_ratios": {"off": 0.0, "low": 0.25, "medium": 0.5, "high": 1.0},
+        "modes": ["off", "low", "medium", "high", "max"],
+        "max_reasoning_tokens": 1024,
+        "mode_budget_ratios": {"off": 0.0, "low": 0.25, "medium": 0.5, "high": 0.75, "max": 1.0},
+        "test_time_compute": {
+            "enabled": True,
+            "mode": "max",
+            "candidates": 3,
+            "candidate_temperature": 1.0,
+            "candidate_top_p": 0.95,
+            "candidate_top_k": 50,
+            "selector_max_new_tokens": 8,
+            "selector_candidate_max_tokens": 256,
+        },
         "scratchpad_instruction": (
             "Reason privately and produce a concise internal scratchpad. Do not write the final response "
             "until the reasoning-off boundary appears. After that boundary, return only the final response "
@@ -316,7 +333,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "item_count": 10,
             "required_correct": 10,
             "choice_labels": ["A", "B", "C", "D"],
-            "reasoning_mode": "high",
+            "reasoning_mode": "max",
             "max_new_tokens": 8,
             "require_denylist_coverage": True,
         },
@@ -927,6 +944,38 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("tokenizer.model_type must be bpe, unigram, char, or word.")
     if int(tokenizer["vocab_size"]) <= 0:
         raise ValueError("tokenizer.vocab_size must be positive.")
+    for key in ("byte_fallback", "split_digits", "numeric_validation", "shuffle_input_sentence"):
+        if not isinstance(tokenizer.get(key), bool):
+            raise ValueError(f"tokenizer.{key} must be true or false.")
+    for key in ("byte_fallback", "split_digits", "numeric_validation"):
+        if tokenizer[key] is not True:
+            raise ValueError(f"tokenizer.{key} must remain true for the current fail-closed tokenizer contract.")
+    normalizer = tokenizer.get("normalization_rule_name")
+    if normalizer != "nmt_nfkc":
+        raise ValueError("tokenizer.normalization_rule_name must remain nmt_nfkc for the current numeric contract.")
+    character_coverage = tokenizer.get("character_coverage")
+    if (
+        isinstance(character_coverage, bool)
+        or not isinstance(character_coverage, (int, float))
+        or not math.isfinite(float(character_coverage))
+        or not 0.98 <= float(character_coverage) <= 1
+    ):
+        raise ValueError("tokenizer.character_coverage must be a finite number in [0.98, 1.0].")
+    input_sentence_size = tokenizer.get("input_sentence_size")
+    if (
+        isinstance(input_sentence_size, bool)
+        or not isinstance(input_sentence_size, int)
+        or input_sentence_size < 0
+        or 0 < input_sentence_size <= 100
+    ):
+        raise ValueError("tokenizer.input_sentence_size must be zero or an integer greater than 100.")
+    numeric_samples = tokenizer.get("numeric_validation_corpus_samples")
+    if isinstance(numeric_samples, bool) or not isinstance(numeric_samples, int) or numeric_samples < 0:
+        raise ValueError("tokenizer.numeric_validation_corpus_samples must be a non-negative integer.")
+    if tokenizer["numeric_validation"] and numeric_samples == 0:
+        raise ValueError(
+            "tokenizer.numeric_validation_corpus_samples must be positive when numeric validation is enabled."
+        )
     special_values = list(tokenizer["special_tokens"].values())
     if any(not isinstance(value, str) or not value.strip() for value in special_values):
         raise ValueError("Every tokenizer.special_tokens value must be a non-empty string.")
@@ -970,6 +1019,31 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("attention_type=mqa requires num_key_value_heads == 1.")
     if int(model["num_layers"]) <= 0:
         raise ValueError("model.num_layers must be positive.")
+    for key in ("qk_norm", "attention_output_gate"):
+        if not isinstance(model.get(key), bool):
+            raise ValueError(f"model.{key} must be true or false.")
+    if model["attention_output_gate"] and not model["qk_norm"]:
+        raise ValueError("model.attention_output_gate requires model.qk_norm=true.")
+    gate_bias = model.get("attention_output_gate_bias")
+    if isinstance(gate_bias, bool) or not isinstance(gate_bias, (int, float)) or not math.isfinite(float(gate_bias)):
+        raise ValueError("model.attention_output_gate_bias must be a finite number.")
+    sliding_window = model.get("sliding_window")
+    if not isinstance(sliding_window, dict):
+        raise ValueError("model.sliding_window must be a mapping.")
+    if not isinstance(sliding_window.get("enabled"), bool):
+        raise ValueError("model.sliding_window.enabled must be true or false.")
+    window_size = sliding_window.get("window_size")
+    if isinstance(window_size, bool) or not isinstance(window_size, int) or window_size <= 0:
+        raise ValueError("model.sliding_window.window_size must be a positive integer.")
+    if sliding_window["enabled"] and window_size > max_positions:
+        raise ValueError("model.sliding_window.window_size must not exceed model.max_position_embeddings when enabled.")
+    layer_pattern = sliding_window.get("layer_pattern")
+    if not isinstance(layer_pattern, list) or any(item not in {"full", "sliding"} for item in layer_pattern):
+        raise ValueError("model.sliding_window.layer_pattern must be a list containing only full and sliding.")
+    if layer_pattern and not sliding_window["enabled"]:
+        raise ValueError("model.sliding_window.layer_pattern requires sliding_window.enabled=true.")
+    if layer_pattern and set(layer_pattern) != {"full", "sliding"}:
+        raise ValueError("model.sliding_window.layer_pattern must contain both full and sliding when configured.")
     for name in ("dropout", "attention_dropout", "residual_dropout", "embedding_dropout"):
         value = float(model[name])
         if not 0.0 <= value < 1.0:
@@ -1272,12 +1346,12 @@ def validate_config(config: dict[str, Any]) -> None:
     modes_list = reasoning.get("modes")
     if (
         not isinstance(modes_list, list)
-        or modes_list != ["off", "low", "medium", "high"]
+        or modes_list != ["off", "low", "medium", "high", "max"]
         or any(not isinstance(mode, str) or not mode.strip() for mode in modes_list)
         or len(modes_list) != len(set(modes_list))
         or reasoning.get("default_mode") not in modes_list
     ):
-        raise ValueError("reasoning.modes must be exactly: off, low, medium, high, and include the default mode.")
+        raise ValueError("reasoning.modes must be exactly: off, low, medium, high, max, and include the default mode.")
     missing_reasoning_tokens = [
         value for value in modes_list if f"reasoning_{value}" not in tokenizer["special_tokens"]
     ]
@@ -1301,6 +1375,41 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("reasoning.mode_budget_ratios values must be finite numbers in [0, 1].")
     if float(budget_ratios.get("off", -1)) != 0:
         raise ValueError("reasoning.mode_budget_ratios.off must be zero.")
+    ordered_ratios = [float(budget_ratios[mode]) for mode in modes_list]
+    if ordered_ratios != sorted(ordered_ratios) or float(budget_ratios["max"]) != 1.0:
+        raise ValueError("reasoning.mode_budget_ratios must increase from off through max, and max must equal one.")
+    test_time_compute = reasoning.get("test_time_compute")
+    if not isinstance(test_time_compute, dict):
+        raise ValueError("reasoning.test_time_compute must be a mapping.")
+    if not isinstance(test_time_compute.get("enabled"), bool):
+        raise ValueError("reasoning.test_time_compute.enabled must be true or false.")
+    if test_time_compute.get("mode") != "max":
+        raise ValueError("reasoning.test_time_compute.mode must be max.")
+    candidates = test_time_compute.get("candidates")
+    if isinstance(candidates, bool) or not isinstance(candidates, int) or not 2 <= candidates <= 26:
+        raise ValueError("reasoning.test_time_compute.candidates must be an integer in [2, 26].")
+    candidate_temperature = test_time_compute.get("candidate_temperature")
+    if (
+        isinstance(candidate_temperature, bool)
+        or not isinstance(candidate_temperature, (int, float))
+        or not math.isfinite(float(candidate_temperature))
+        or float(candidate_temperature) < 0
+    ):
+        raise ValueError("reasoning.test_time_compute.candidate_temperature must be finite and non-negative.")
+    candidate_top_p = test_time_compute.get("candidate_top_p")
+    if (
+        isinstance(candidate_top_p, bool)
+        or not isinstance(candidate_top_p, (int, float))
+        or not math.isfinite(float(candidate_top_p))
+        or not 0 < float(candidate_top_p) <= 1
+    ):
+        raise ValueError("reasoning.test_time_compute.candidate_top_p must be finite and in (0, 1].")
+    for key in ("candidate_top_k", "selector_max_new_tokens", "selector_candidate_max_tokens"):
+        value = test_time_compute.get(key)
+        minimum = 0 if key == "candidate_top_k" else 1
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            qualifier = "non-negative" if minimum == 0 else "positive"
+            raise ValueError(f"reasoning.test_time_compute.{key} must be a {qualifier} integer.")
     for key in ("scratchpad_instruction",):
         value = reasoning.get(key)
         if not isinstance(value, str) or not value.strip():
@@ -1380,6 +1489,10 @@ def redacted_config_for_artifact(config: Mapping[str, Any]) -> dict[str, Any]:
         eval_cfg["knowledge_pilot"]["file"] = "<redacted-local-data>"
     if eval_cfg.get("knowledge_pilot", {}).get("prompt_file") is not None:
         eval_cfg["knowledge_pilot"]["prompt_file"] = "<redacted-local-data>"
+    policy_cfg = redacted.get("data_policy", {})
+    for key in ("source_lock_path", "audit_path", "benchmark_denylist_path"):
+        if policy_cfg.get(key) is not None:
+            policy_cfg[key] = "<redacted-local-evidence>"
     reasoning_cfg = redacted.get("reasoning", {})
     if reasoning_cfg.get("scratchpad_instruction"):
         reasoning_cfg["scratchpad_instruction"] = "<redacted-local-prompt>"

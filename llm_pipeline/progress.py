@@ -7,6 +7,7 @@ incomplete runnable stage is selected from run.sequence.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -14,17 +15,26 @@ from typing import Any
 from .artifacts import (
     analysis_fingerprint,
     build_rejects_fingerprint,
+    bundle_lock_path,
     checkpoint_dataset_type,
     checkpoint_fingerprint,
     checkpoint_is_loadable,
     completed_stage_checkpoint,
     evaluation_fingerprint,
+    exclusive_file_lock,
     export_fingerprint,
     inference_fingerprint,
+    recover_file_bundle,
     tokenizer_training_fingerprint,
     training_fingerprint,
 )
 from .data import source_manifest_fingerprint
+from .tokenizer import (
+    NUMERIC_VALIDATION_PROBES,
+    TOKENIZER_BEHAVIOR_VERSION,
+    TOKENIZER_VALIDATION_FILENAME,
+    numeric_probe_suite_sha256,
+)
 
 DEFAULT_MODE_SEQUENCE = [
     "train_tokenizer",
@@ -158,11 +168,12 @@ def read_first_json_row(path: str | Path) -> dict[str, Any] | None:
     return None
 
 
-def mode_is_complete(mode: str, config: dict[str, Any]) -> bool:
-    """Return True when current artifacts prove a mode is already complete."""
+def _tokenizer_mode_is_complete(config: dict[str, Any]) -> bool:
+    """Validate one published tokenizer bundle while its writer lock is held."""
 
-    if mode == "train_tokenizer":
-        tokenizer_dir = Path(config["tokenizer"]["save_dir"])
+    tokenizer_dir = Path(config["tokenizer"]["save_dir"])
+    with exclusive_file_lock(bundle_lock_path(tokenizer_dir)):
+        recover_file_bundle(tokenizer_dir)
         if not all(
             (tokenizer_dir / name).exists()
             for name in (
@@ -170,19 +181,47 @@ def mode_is_complete(mode: str, config: dict[str, Any]) -> bool:
                 "tokenizer.json",
                 "special_tokens_map.json",
                 "tokenizer_config.json",
+                TOKENIZER_VALIDATION_FILENAME,
             )
         ):
             return False
         try:
             tokenizer_config = json.loads((tokenizer_dir / "tokenizer_config.json").read_text(encoding="utf-8"))
-        except Exception:
+            validation = json.loads((tokenizer_dir / TOKENIZER_VALIDATION_FILENAME).read_text(encoding="utf-8"))
+            if not isinstance(tokenizer_config, dict) or not isinstance(validation, dict):
+                return False
+            model_digest = hashlib.sha256((tokenizer_dir / "tokenizer.model").read_bytes()).hexdigest()
+            target_vocab_size = int(tokenizer_config.get("target_vocab_size", tokenizer_config.get("vocab_size", 0)))
+            probe_count = int(validation.get("probe_count", -1))
+            corpus_samples_checked = int(validation.get("corpus_samples_checked", 0))
+            unk_count = int(validation.get("unk_count", -1))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, OverflowError):
             return False
         return (
             tokenizer_config.get("data_sources_fingerprint") == source_manifest_fingerprint(config, "tokenizer")
             and tokenizer_config.get("training_fingerprint") == tokenizer_training_fingerprint(config)
-            and int(tokenizer_config.get("target_vocab_size", tokenizer_config.get("vocab_size", 0)))
-            == int(config["tokenizer"]["vocab_size"])
+            and target_vocab_size == int(config["tokenizer"]["vocab_size"])
+            and tokenizer_config.get("behavior_version") == TOKENIZER_BEHAVIOR_VERSION
+            and tokenizer_config.get("model_sha256") == model_digest
+            and tokenizer_config.get("split_digits") == config["tokenizer"]["split_digits"]
+            and tokenizer_config.get("normalization_rule_name") == config["tokenizer"]["normalization_rule_name"]
+            and validation.get("status") == "passed"
+            and validation.get("behavior_version") == TOKENIZER_BEHAVIOR_VERSION
+            and validation.get("model_sha256") == model_digest
+            and validation.get("split_digits") == config["tokenizer"]["split_digits"]
+            and validation.get("normalization_rule_name") == config["tokenizer"]["normalization_rule_name"]
+            and probe_count == len(NUMERIC_VALIDATION_PROBES)
+            and validation.get("probe_suite_sha256") == numeric_probe_suite_sha256()
+            and corpus_samples_checked > 0
+            and unk_count == 0
         )
+
+
+def mode_is_complete(mode: str, config: dict[str, Any]) -> bool:
+    """Return True when current artifacts prove a mode is already complete."""
+
+    if mode == "train_tokenizer":
+        return _tokenizer_mode_is_complete(config)
     if mode == "analyze_data":
         stats_path = run_log_dir(config) / "data_stats.json"
         try:
