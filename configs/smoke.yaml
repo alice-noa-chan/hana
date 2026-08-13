@@ -1,0 +1,317 @@
+schema_version: 2
+
+profile:
+  id: "smoke_test"
+  display_name: "Smoke Test Assistant"
+  assistant_label: "Smoke Test Assistant"
+
+run:
+  mode: "auto"
+  sequence:
+    - "train_tokenizer"
+    - "analyze_data"
+    - "pretrain"
+    - "eval"
+    - "inference"
+    - "export"
+    - "quantize"
+  seed: 7
+  deterministic: false
+  output_dir: "./.smoke/checkpoints"
+  resume: false
+  experiment_name: "synthetic_smoke"
+
+data:
+  pack:
+    name: "synthetic-smoke"
+    version: 1
+    languages: ["en"]
+    description: "Generated ASCII-only smoke input for repository tests; never production data."
+  train_file: "./.smoke/input/synthetic.jsonl"
+  valid_file: "./.smoke/input/synthetic.jsonl"
+  test_file: "./.smoke/input/synthetic.jsonl"
+  raw_dir: "./.smoke/input"
+  format: "jsonl"
+  dataset_type: "pretrain"
+  text_field: "text"
+  prompt_field: "prompt"
+  chosen_field: "chosen"
+  rejected_field: "rejected"
+  messages_field: "messages"
+  normalize_nfkc: true
+  dedup: true
+  dedup_level: "sample"
+  hash_split: true
+  train_ratio: 0.8
+  valid_ratio: 0.1
+  test_ratio: 0.1
+  min_chars: 1
+  max_chars: 200000
+  processed_dir: "./.smoke/processed"
+  token_cache_dir: "./.smoke/token_cache"
+  sequence_packing: true
+  streaming: false
+  truncation_policy: "recent"
+  sources_file: null
+  sources: []
+
+tokenizer:
+  type: "sentencepiece"
+  model_type: "bpe"
+  vocab_size: 1024
+  byte_fallback: true
+  character_coverage: 0.9995
+  input_sentence_size: 10000000
+  shuffle_input_sentence: true
+  save_dir: "./.smoke/tokenizer"
+  model_path: "./.smoke/tokenizer/tokenizer.model"
+  special_tokens:
+    pad: "<pad>"
+    unk: "<unk>"
+    bos: "<s>"
+    eos: "</s>"
+    user: "<user>"
+    assistant: "<assistant>"
+    system: "<system>"
+    reasoning_off: "<reasoning:off>"
+    reasoning_low: "<reasoning:low>"
+    reasoning_medium: "<reasoning:medium>"
+    reasoning_high: "<reasoning:high>"
+    mask: "<mask>"
+
+model:
+  architecture: "decoder_only"
+  vocab_size: 1024
+  hidden_size: 64
+  num_layers: 2
+  num_attention_heads: 4
+  num_key_value_heads: 2
+  max_position_embeddings: 96
+  max_seq_len: 64
+  rope: true
+  rope_scaling:
+    enabled: false
+    type: "linear"
+    factor: 1.0
+  norm: "rmsnorm"
+  activation: "swiglu"
+  attention_type: "gqa"
+  attention_backend: "auto"
+  sliding_window:
+    enabled: false
+    window_size: 128
+  dropout: 0.0
+  attention_dropout: 0.0
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  tie_embeddings: true
+  use_bias: false
+  gradient_checkpointing: false
+
+long_context_experimental:
+  activation_beacon:
+    enabled: false
+  ring_attention:
+    enabled: false
+  index_share:
+    enabled: false
+    reuse_group_size: 4
+  csa:
+    enabled: false
+    top_k: 256
+    compression_ratio: 4
+  compare_with_dense: true
+
+mtp:
+  enabled: false
+  num_future_tokens: 2
+  loss_weight: 0.2
+
+hybrid_diffusion:
+  enabled: true
+  loss_weight: 0.2
+  mask_probability: 0.5
+  block_size: 8
+  denoise_steps: 2
+  ar_warmup_tokens: 2
+
+experiments:
+  enabled: true
+  output_dir: "./.smoke/experiments"
+  activation_monitor:
+    enabled: true
+    modules: ["layers.0"]
+    every_n_calls: 1
+    max_records: 100
+    sample_values: 4
+    output_file: "activations.jsonl"
+  gradient_monitor:
+    enabled: true
+    parameters: ["layers.0.*"]
+    every_n_steps: 1
+    max_records: 100
+    output_file: "gradients.jsonl"
+  interventions: []
+  runtime_patches:
+    - at_step: 1
+      changes:
+        train.label_smoothing: 0.01
+        hybrid_diffusion.mask_probability: 0.4
+
+cognitive_architecture:
+  enabled: true
+  workspace:
+    enabled: true
+    bottleneck_size: 16
+    every_n_layers: 1
+    gate_bias: -2.0
+  predictive_coding:
+    enabled: true
+    loss_weight: 0.02
+  homeostasis:
+    enabled: true
+    target_rms: 0.05
+    loss_weight: 0.001
+  neuromodulation:
+    enabled: true
+    ema_decay: 0.9
+    plasticity_gain: 0.1
+    fatigue_rate: 0.01
+    recovery_rate: 0.01
+    min_lr_scale: 0.8
+    max_lr_scale: 1.2
+  replay:
+    enabled: true
+    capacity: 4
+    every_n_steps: 2
+    min_items: 1
+    weight: 0.25
+    priority_alpha: 0.7
+  memory:
+    enabled: true
+    path: "./.smoke/cognitive_state/memory.json"
+    max_episodes: 8
+    working_memory_slots: 2
+    retrieval_top_k: 2
+    similarity_threshold: 0.8
+    consolidate_every: 2
+    max_context_chars: 500
+    recency_half_life_hours: 24.0
+    store_threshold: 0.0
+
+reasoning:
+  enabled: true
+  default_mode: "medium"
+  modes: ["off", "low", "medium", "high"]
+  max_reasoning_tokens: 64
+  expose_reasoning_trace: false
+  save_reasoning_trace: false
+
+train:
+  epochs: 1
+  max_steps: 2
+  micro_batch_size: 1
+  gradient_accumulation_steps: 1
+  target_tokens_per_step: 64
+  learning_rate: 0.0005
+  min_learning_rate: 0.0001
+  weight_decay: 0.01
+  optimizer: "adamw"
+  scheduler: "linear"
+  warmup_steps: 0
+  warmup_ratio: 0.0
+  max_grad_norm: 1.0
+  label_smoothing: 0.0
+  mixed_precision: "fp32"
+  early_stopping:
+    enabled: false
+    patience: 1
+    metric: "valid_loss"
+    mode: "min"
+  save_interval_steps: 1
+  eval_interval_steps: 1
+  log_interval_steps: 1
+  top_k_checkpoints: 2
+  nan_inf_policy: "stop"
+  assistant_only_loss: false
+
+hardware:
+  device: "cpu"
+  target_vram_usage: 0.9
+  auto_batch_size: false
+  find_executable_batch_size: false
+  auto_micro_batch_min: 1
+  auto_micro_batch_max: 8
+  auto_batch_growth_factor: 2.0
+  oom_retry: true
+  auto_shrink_seq_len: false
+  distributed: "auto"
+  ddp_backend: "auto"
+  ddp_timeout_minutes: 60
+  ddp_find_unused_parameters: false
+  data_parallel: "auto"
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: 2
+
+dpo:
+  enabled: false
+  beta: 0.1
+  reference_model_path: "./.smoke/checkpoints/synthetic_smoke/sft/best"
+  loss_type: "sigmoid"
+  best_metric: "valid_dpo_loss"
+  generate_rejected:
+    temperature: 0.8
+    top_p: 0.95
+    top_k: 50
+    max_new_tokens: 64
+
+eval:
+  calculate_perplexity: true
+  calculate_token_accuracy: true
+  instruction_file: null
+  long_context_file: null
+  multiturn_memory:
+    enabled: false
+    n_turns: 2
+    file: null
+  long_context:
+    enabled: false
+  checkpoints: ["latest", "best"]
+
+inference:
+  model_path: "best"
+  model_system_prompt_files: []
+  prompt: "Describe this synthetic smoke test in one short sentence."
+  interactive: false
+  reasoning_mode: "medium"
+  temperature: 0.0
+  top_p: 0.9
+  top_k: 20
+  repetition_penalty: 1.05
+  max_new_tokens: 8
+  min_output_chars: 0
+  use_kv_cache: true
+  use_speculative_decoding: false
+  generation_strategy: "hybrid"
+  token_trace_file: "./.smoke/experiments/token_trace.jsonl"
+
+export:
+  save_safetensors: true
+  source_checkpoint: "best"
+  export_non_it_dir: "./.smoke/exports/non_it"
+  export_it_dir: "./.smoke/exports/it"
+  export_quantized_dir: "./.smoke/exports/quantized"
+
+quantization:
+  enabled: false
+  method: "none"
+
+data_policy:
+  enforce: false
+  use_case: "internal_noncommercial_research"
+
+logging:
+  log_dir: "./logs"
+  jsonl_log: true
+  tensorboard: false

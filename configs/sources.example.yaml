@@ -1,0 +1,103 @@
+# Copy this file to train_data/sources.local.yaml and replace every placeholder.
+# With data-policy enforcement enabled, only reviewed sources with acceptable
+# provenance, privacy, and child-safety status can enter training streams.
+
+pack:
+  name: "portable-en-es-demo"
+  version: 1
+  languages: ["en", "es"]
+  description: "Example English and Spanish data pack for the reusable training core."
+
+sources:
+  - name: "internally_authored_example"
+    path: "./train_data/authored.jsonl"
+    schema: "text"
+    purpose: "training"
+    stages: ["pretrain"]
+    split: "all"
+    tokenizer: true
+    languages: ["en"]
+    domain: "general"
+    sample_rate: 1.0
+    provenance:
+      source_url: "internal://project/authored"
+      revision: "replace-with-private-revision"
+      license_status: "approved"
+      allowed_uses: ["internal_noncommercial_research"]
+      pii_status: "author_controlled"
+      child_safety_status: "author_controlled"
+      reviewed_by: "replace-with-reviewer"
+      reviewed_at: "replace-with-review-time"
+      evidence: "Describe authorship and review evidence."
+
+  - name: "restricted_research_example"
+    path: "./train_data/restricted.jsonl"
+    schema: "text"
+    purpose: "training"
+    stages: ["pretrain"]
+    split: "all"
+    tokenizer: true
+    languages: ["es"]
+    domain: "general"
+    # sample_rate uses a deterministic hash. The same row is kept on every run.
+    sample_rate: 0.5
+    provenance:
+      source_url: "https://example.invalid/dataset"
+      revision: "replace-with-upstream-revision"
+      license_status: "restricted_research"
+      allowed_uses: ["internal_noncommercial_research"]
+      pii_status: "filtered"
+      child_safety_status: "filtered"
+      reviewed_by: "replace-with-reviewer"
+      reviewed_at: "replace-with-review-time"
+      evidence: "Describe the restriction and deterministic filtering."
+      evidence_path: "./train_data/restricted.audit.json"
+      evidence_sha256: "replace-with-lowercase-sha256"
+
+  - name: "explicit_translation_example"
+    path: "./train_data/spanish_english_sft.jsonl"
+    schema: "translation"
+    purpose: "training"
+    stages: ["sft"]
+    split: "all"
+    tokenizer: true
+    languages: ["es", "en"]
+    domain: "translation"
+    source_lang_field: "spanish_text"
+    target_lang_field: "english_text"
+    source_lang: "Spanish"
+    target_lang: "English"
+    # A pack supplies its own natural prompt. The core does not assume Korean or Japanese.
+    prompt_template: "Traduce este texto al inglés.\n{source_text}"
+    provenance:
+      source_url: "internal://project/spanish-english-sft"
+      revision: "replace-with-private-revision"
+      license_status: "approved"
+      allowed_uses: ["internal_noncommercial_research"]
+      pii_status: "author_controlled"
+      child_safety_status: "author_controlled"
+      reviewed_by: "replace-with-reviewer"
+      reviewed_at: "replace-with-review-time"
+      evidence: "Describe parallel-text authorship and review evidence."
+
+  # This entry demonstrates quarantine metadata. The generic evaluation stage
+  # does not execute it automatically; a licensed suite needs an isolated evaluator.
+  - name: "evaluation_only_example"
+    path: "./train_data/evaluation.jsonl"
+    schema: "text"
+    purpose: "evaluation"
+    stages: ["eval"]
+    split: "test"
+    tokenizer: false
+    languages: ["en"]
+    domain: "evaluation"
+    provenance:
+      source_url: "https://example.invalid/benchmark"
+      revision: "replace-with-upstream-revision"
+      license_status: "blocked"
+      allowed_uses: []
+      pii_status: "unknown"
+      child_safety_status: "unknown"
+      reviewed_by: "replace-with-reviewer"
+      reviewed_at: "replace-with-review-time"
+      evidence: "This example is deliberately blocked. Verify a real evaluation license before use."

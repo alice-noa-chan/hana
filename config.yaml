@@ -1,0 +1,381 @@
+schema_version: 2
+
+profile:
+  id: "hana"
+  display_name: "Hana"
+  assistant_label: "Hana"
+
+run:
+  mode: "auto"
+  sequence:
+    - "train_tokenizer"
+    - "analyze_data"
+    - "pretrain"
+    - "sft"
+    - "build_rejects"
+    - "dpo"
+    - "eval"
+    - "inference"
+    - "export"
+    - "quantize"
+  seed: 42
+  deterministic: false
+  output_dir: "./checkpoints"
+  resume: true
+  experiment_name: "hana_llm_experiment"
+  require_clean_git: true
+
+data:
+  pack:
+    name: "private-local-pack"
+    version: 1
+    languages: []
+    description: "Operator-supplied private data pack; contents are not distributed with the code."
+  raw_dir: "./train_data"
+  processed_dir: "./train_data/processed"
+  train_file: "./train_data/train.local.jsonl"
+  valid_file: "./train_data/valid.local.jsonl"
+  test_file: "./train_data/test.local.jsonl"
+  format: "jsonl"
+  dataset_type: "pretrain"
+  text_field: "text"
+  prompt_field: "prompt"
+  chosen_field: "chosen"
+  rejected_field: "rejected"
+  messages_field: "messages"
+  normalize_nfkc: true
+  dedup: true
+  dedup_level: "sample"
+  dedup_backend: "sqlite"
+  hash_split: true
+  train_ratio: 0.98
+  valid_ratio: 0.01
+  test_ratio: 0.01
+  min_chars: 10
+  max_chars: 200000
+  max_samples_per_source: null
+  strict_sources: true
+  require_all_training_sources: true
+  token_cache_dir: "./train_data/token_cache"
+  sequence_packing: true
+  streaming: true
+  token_cache_shard_size: 4096
+  token_cache_log_interval_shards: 25
+  truncation_policy: "recent"
+  sources_file: "./train_data/sources.local.yaml"
+  sources: []
+
+tokenizer:
+  type: "sentencepiece"
+  model_type: "bpe"
+  vocab_size: 32000
+  byte_fallback: true
+  character_coverage: 0.9995
+  # This conservative default still needs measurement on the operator's hardware.
+  input_sentence_size: 500000
+  shuffle_input_sentence: true
+  save_dir: "./train_data/tokenizer"
+  model_path: "./train_data/tokenizer/tokenizer.model"
+  special_tokens:
+    pad: "<pad>"
+    unk: "<unk>"
+    bos: "<s>"
+    eos: "</s>"
+    user: "<user>"
+    assistant: "<assistant>"
+    system: "<system>"
+    reasoning_off: "<reasoning:off>"
+    reasoning_low: "<reasoning:low>"
+    reasoning_medium: "<reasoning:medium>"
+    reasoning_high: "<reasoning:high>"
+    mask: "<mask>"
+
+model:
+  architecture: "decoder_only"
+  vocab_size: 32000
+  # 303M-parameter research baseline; auto microbatching keeps it usable on
+  # common 16-24 GB GPUs while DDP scales it across larger servers.
+  hidden_size: 1024
+  num_layers: 24
+  num_attention_heads: 16
+  num_key_value_heads: 4
+  max_position_embeddings: 2048
+  max_seq_len: 2048
+  rope: true
+  rope_scaling:
+    enabled: false
+    type: "linear"
+    factor: 1.0
+  rope_theta: 10000.0
+  norm: "rmsnorm"
+  activation: "swiglu"
+  attention_type: "gqa"
+  attention_backend: "auto"
+  sliding_window:
+    enabled: false
+    window_size: 1024
+  dropout: 0.0
+  attention_dropout: 0.0
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  tie_embeddings: true
+  use_bias: false
+  # true / false / "auto" (auto enables only for large models)
+  gradient_checkpointing: true
+  # QK-norm, logit soft-capping, and init std improve large-model stability.
+  qk_norm: false
+  logit_softcap: 0.0
+  initializer_range: 0.02
+
+long_context_experimental:
+  activation_beacon:
+    enabled: false
+  ring_attention:
+    enabled: false
+  index_share:
+    enabled: false
+    reuse_group_size: 4
+  csa:
+    enabled: false
+    top_k: 256
+    compression_ratio: 4
+  compare_with_dense: true
+
+mtp:
+  enabled: false
+  num_future_tokens: 2
+  loss_weight: 0.2
+
+# AR predicts between blocks; masked denoising resolves tokens inside each block.
+hybrid_diffusion:
+  enabled: false
+  loss_weight: 0.25
+  mask_probability: 0.3
+  block_size: 16
+  denoise_steps: 4
+  ar_warmup_tokens: 4
+
+# Opt-in internal telemetry and shape-safe runtime control. Module names use
+# fnmatch patterns such as "layers.0" or "layers.*.ffn".
+experiments:
+  enabled: false
+  output_dir: "./experiments"
+  activation_monitor:
+    enabled: false
+    modules: ["layers.0", "layers.6", "layers.12", "layers.18", "layers.23"]
+    every_n_calls: 1
+    max_records: 10000
+    # 0 disables raw values; maximum 256 prevents accidental activation dumps.
+    sample_values: 16
+    output_file: "activations.jsonl"
+  gradient_monitor:
+    enabled: false
+    parameters: ["layers.*"]
+    every_n_steps: 10
+    max_records: 10000
+    output_file: "gradients.jsonl"
+  interventions: []
+  # Example:
+  # interventions:
+  #   - {module: "layers.2", kind: "scale", value: 0.8, start_step: 100, end_step: 200}
+  runtime_patches: []
+  # Example:
+  # runtime_patches:
+  #   - at_step: 1000
+  #     changes: {train.learning_rate: 0.0001, hybrid_diffusion.loss_weight: 0.5}
+
+# Brain-inspired computation, translated into causal and testable mechanisms.
+cognitive_architecture:
+  enabled: false
+  workspace:
+    enabled: true
+    bottleneck_size: 64
+    every_n_layers: 2
+    gate_bias: -2.0
+  predictive_coding:
+    enabled: true
+    loss_weight: 0.05
+  homeostasis:
+    enabled: true
+    target_rms: 0.05
+    loss_weight: 0.001
+  neuromodulation:
+    enabled: true
+    ema_decay: 0.95
+    plasticity_gain: 0.15
+    fatigue_rate: 0.02
+    recovery_rate: 0.01
+    min_lr_scale: 0.7
+    max_lr_scale: 1.3
+  replay:
+    enabled: true
+    capacity: 64
+    every_n_steps: 10
+    min_items: 4
+    weight: 0.5
+    priority_alpha: 0.7
+  memory:
+    enabled: true
+    path: "./cognitive_state/memory.json"
+    max_episodes: 256
+    working_memory_slots: 4
+    retrieval_top_k: 4
+    similarity_threshold: 0.78
+    consolidate_every: 8
+    max_context_chars: 2000
+    recency_half_life_hours: 168.0
+    store_threshold: 0.15
+
+reasoning:
+  enabled: true
+  default_mode: "medium"
+  modes: ["off", "low", "medium", "high"]
+  max_reasoning_tokens: 512
+  expose_reasoning_trace: false
+  save_reasoning_trace: false
+
+train:
+  # One uncapped epoch guarantees that every accepted training row is consumed.
+  # Add epochs only after measuring the resulting token/parameter ratio.
+  epochs: 1
+  max_steps: null
+  micro_batch_size: "auto"
+  gradient_accumulation_steps: "auto"
+  target_tokens_per_step: 32768
+  learning_rate: 0.0003
+  min_learning_rate: 0.00003
+  weight_decay: 0.1
+  optimizer: "adamw"
+  fused_adamw: "auto"
+  foreach_optimizer: "auto"
+  # torch.compile: true / false / "auto" (auto = CUDA only). compile_mode:
+  # "default" | "reduce-overhead" | "max-autotune".
+  compile: "auto"
+  compile_mode: "default"
+  scheduler: "cosine"
+  warmup_steps: null
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  label_smoothing: 0.0
+  # z-loss regularizes the softmax normalizer; small values (e.g. 1e-4) help bf16.
+  z_loss_weight: 0.0
+  mixed_precision: "auto"
+  early_stopping:
+    # A minimum-one-pass run must not stop before the corpus is exhausted.
+    enabled: false
+    patience: 3
+    metric: "valid_loss"
+    mode: "min"
+  save_interval_steps: 1000
+  eval_interval_steps: 1000
+  log_interval_steps: 10
+  top_k_checkpoints: 3
+  nan_inf_policy: "stop"
+  assistant_only_loss: true
+  sft_init_checkpoint: "auto"
+
+hardware:
+  device: "auto"
+  target_vram_usage: 0.9
+  auto_batch_size: true
+  find_executable_batch_size: true
+  auto_micro_batch_min: 1
+  auto_micro_batch_max: 1024
+  auto_batch_growth_factor: 2.0
+  oom_retry: true
+  auto_shrink_seq_len: false
+  distributed: "auto"
+  ddp_backend: "auto"
+  ddp_timeout_minutes: 60
+  ddp_find_unused_parameters: false
+  data_parallel: "auto"
+  num_workers: 2
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+  non_blocking_transfer: true
+  allow_tf32: true
+  float32_matmul_precision: "high"
+
+dpo:
+  # Enable DPO only in a private local override that names reviewed SFT sources.
+  enabled: false
+  beta: 0.1
+  policy_model_path: "auto"
+  reference_model_path: "auto"
+  train_file: "./train_data/processed/dpo_rejected.jsonl"
+  valid_file: null
+  test_file: null
+  prompt_sources: []
+  max_prompt_samples: 3000
+  loss_type: "sigmoid"
+  best_metric: "valid_dpo_loss"
+  generate_rejected:
+    temperature: 0.8
+    top_p: 0.95
+    top_k: 50
+    max_new_tokens: 128
+
+eval:
+  calculate_perplexity: true
+  calculate_token_accuracy: true
+  batch_size: 8
+  instruction_file: null
+  long_context_file: null
+  multiturn_memory:
+    enabled: false
+    n_turns: 10
+    file: null
+  long_context:
+    enabled: false
+  checkpoints: ["latest", "best"]
+
+inference:
+  model_path: "best"
+  model_system_prompt: ""
+  # Private identity and safety prompts belong in an ignored local profile.
+  model_system_prompt_files: []
+  user_system_prompt: ""
+  user_system_prompt_file: null
+  prompt: "Hello, who are you?"
+  interactive: false
+  reasoning_mode: "medium"
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 50
+  repetition_penalty: 1.1
+  max_new_tokens: 256
+  use_kv_cache: true
+  use_speculative_decoding: false
+  # Keep the public architecture baseline autoregressive. Enable hybrid only in a
+  # separately evaluated experiment config with matching mask curriculum.
+  generation_strategy: "ar"
+  # JSONL with token ids, pieces, entropy, confidence, and top probabilities.
+  token_trace_file: "./experiments/token_trace.jsonl"
+
+export:
+  save_safetensors: true
+  source_checkpoint: "best"
+  export_non_it_dir: "./exports/non_it"
+  export_it_dir: "./exports/it"
+  export_quantized_dir: "./exports/quantized"
+
+quantization:
+  enabled: true
+  method: "int8"
+
+data_policy:
+  enforce: true
+  use_case: "internal_noncommercial_research"
+  # A private override may enable audit-gated sources after local review.
+  allow_audit_gated_sources: false
+  source_lock_path: "./train_data/sources.lock.json"
+  audit_path: "./train_data/data_audit.json"
+  benchmark_denylist_path: "./train_data/benchmark_denylist.txt"
+  require_benchmark_denylist: true
+  max_rejection_hashes_per_source: 25
+
+logging:
+  log_dir: "./logs"
+  jsonl_log: true
+  tensorboard: true
