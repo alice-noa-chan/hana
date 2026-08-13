@@ -12,12 +12,17 @@ import hashlib
 import json
 import os
 import shutil
+import tempfile
 import uuid
 from collections.abc import Iterable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 ARTIFACT_SCHEMA_VERSION = 1
+REASONING_GENERATION_PROTOCOL_VERSION = 2
+TOKENIZER_BEHAVIOR_VERSION = 2
+BUNDLE_TRANSACTION_VERSION = 1
 
 
 def atomic_write_text(path: str | Path, text: str) -> None:
@@ -67,6 +72,163 @@ def atomic_replace_directory(staged: str | Path, target: str | Path) -> None:
     else:
         if backup.exists():
             shutil.rmtree(backup)
+
+
+@contextmanager
+def exclusive_file_lock(path: str | Path):
+    """Hold one cross-process byte-range lock on Windows or POSIX."""
+
+    lock_path = Path(path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def bundle_lock_path(target: str | Path) -> Path:
+    """Return the stable sibling lock used for a multi-file artifact bundle."""
+
+    target_path = Path(target)
+    return target_path.parent / f".{target_path.name}.bundle.lock"
+
+
+def _bundle_journal_path(target: Path) -> Path:
+    return target.parent / f".{target.name}.bundle.transaction.json"
+
+
+def _safe_transaction_root(target: Path, value: Any) -> Path:
+    root = Path(str(value))
+    try:
+        if root.resolve().parent != target.parent.resolve() or not root.name.startswith(f".{target.name}.bundle-"):
+            raise RuntimeError("Artifact bundle journal points outside its expected transaction directory.")
+    except OSError as exc:
+        raise RuntimeError("Artifact bundle transaction directory cannot be resolved safely.") from exc
+    return root
+
+
+def recover_file_bundle(target: str | Path) -> bool:
+    """Roll back an interrupted multi-file publish from its durable journal.
+
+    The caller must hold ``exclusive_file_lock(bundle_lock_path(target))``.
+    Returning ``True`` means an interrupted transaction was recovered.
+    """
+
+    target_path = Path(target)
+    journal_path = _bundle_journal_path(target_path)
+    if not journal_path.exists():
+        return False
+    try:
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("Artifact bundle transaction journal is unreadable; refusing unsafe recovery.") from exc
+    if (
+        not isinstance(journal, dict)
+        or journal.get("version") != BUNDLE_TRANSACTION_VERSION
+        or Path(str(journal.get("target"))).resolve() != target_path.resolve()
+    ):
+        raise RuntimeError("Artifact bundle transaction journal does not match its target.")
+    names = journal.get("names")
+    previous_names = journal.get("previous_names")
+    if (
+        not isinstance(names, list)
+        or not names
+        or any(not isinstance(name, str) or not name or Path(name).name != name for name in names)
+        or not isinstance(previous_names, list)
+        or any(name not in names for name in previous_names)
+    ):
+        raise RuntimeError("Artifact bundle transaction journal contains unsafe artifact names.")
+    transaction_root = _safe_transaction_root(target_path, journal.get("transaction_root"))
+    backup = transaction_root / "backup"
+    incoming = transaction_root / "incoming"
+    if not transaction_root.is_dir() or not backup.is_dir() or not incoming.is_dir():
+        raise RuntimeError("Artifact bundle recovery files are missing; refusing an unsafe partial recovery.")
+    target_path.mkdir(parents=True, exist_ok=True)
+    previous = set(previous_names)
+    for name in names:
+        current = target_path / name
+        saved = backup / name
+        if name in previous:
+            if saved.exists():
+                current.unlink(missing_ok=True)
+                saved.replace(current)
+        else:
+            current.unlink(missing_ok=True)
+    journal_path.unlink(missing_ok=True)
+    if transaction_root.exists():
+        shutil.rmtree(transaction_root)
+    return True
+
+
+def atomic_replace_file_bundle(staged: str | Path, target: str | Path, names: Iterable[str]) -> None:
+    """Publish related files with locking, rollback, and crash recovery."""
+
+    staged_path = Path(staged)
+    target_path = Path(target)
+    artifact_names = tuple(names)
+    if not artifact_names or any(Path(name).name != name for name in artifact_names):
+        raise ValueError("Artifact bundle names must be non-empty basenames.")
+    if any(not (staged_path / name).is_file() for name in artifact_names):
+        raise FileNotFoundError("A staged artifact bundle file is missing.")
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    transaction_root = Path(tempfile.mkdtemp(prefix=f".{target_path.name}.bundle-", dir=target_path.parent))
+    incoming = transaction_root / "incoming"
+    backup = transaction_root / "backup"
+    incoming.mkdir()
+    backup.mkdir()
+    for name in artifact_names:
+        shutil.copy2(staged_path / name, incoming / name)
+    journal_path = _bundle_journal_path(target_path)
+    succeeded = False
+    journal_owned = False
+    try:
+        with exclusive_file_lock(bundle_lock_path(target_path)):
+            recover_file_bundle(target_path)
+            target_path.mkdir(parents=True, exist_ok=True)
+            previous_names = [name for name in artifact_names if (target_path / name).exists()]
+            atomic_write_json(
+                journal_path,
+                {
+                    "version": BUNDLE_TRANSACTION_VERSION,
+                    "target": str(target_path.resolve()),
+                    "transaction_root": str(transaction_root.resolve()),
+                    "names": list(artifact_names),
+                    "previous_names": previous_names,
+                },
+            )
+            journal_owned = True
+            try:
+                for name in previous_names:
+                    (target_path / name).replace(backup / name)
+                for name in artifact_names:
+                    (incoming / name).replace(target_path / name)
+            except BaseException:
+                recover_file_bundle(target_path)
+                raise
+            journal_path.unlink(missing_ok=True)
+            succeeded = True
+    finally:
+        if (not journal_owned or succeeded or not journal_path.exists()) and transaction_root.exists():
+            shutil.rmtree(transaction_root)
 
 
 def _clean_config(value: Any) -> Any:
@@ -133,7 +295,7 @@ def _expand_paths(values: Iterable[str | Path]) -> list[Path]:
 
 
 def data_signature(config: dict[str, Any], stage: str) -> list[dict[str, Any]]:
-    """Return cheap metadata signatures for files that can feed a stage."""
+    """Return content signatures for files that can feed a stage."""
 
     data = config["data"]
     configured: list[str | Path] = []
@@ -156,7 +318,7 @@ def data_signature(config: dict[str, Any], stage: str) -> list[dict[str, Any]]:
             continue
         values = source.get("paths", source.get("path", []))
         configured.extend(values if isinstance(values, list) else [values])
-    return [_file_signature(path) for path in _expand_paths(value for value in configured if value)]
+    return [_file_content_signature(path) for path in _expand_paths(value for value in configured if value)]
 
 
 def checkpoint_fingerprint(checkpoint: str | Path) -> str:
@@ -271,7 +433,7 @@ def training_fingerprint(config: dict[str, Any], stage: str) -> str:
         "data": config["data"],
         "data_files": data_signature(config, stage),
         "tokenizer": config["tokenizer"],
-        "tokenizer_model": _file_signature(config["tokenizer"]["model_path"]),
+        "tokenizer_model": _file_content_signature(config["tokenizer"]["model_path"]),
         "model": model_config,
         "mtp": config["mtp"],
         "hybrid_diffusion": config["hybrid_diffusion"],
@@ -314,6 +476,7 @@ def tokenizer_training_fingerprint(config: dict[str, Any]) -> str:
     tokenizer_config.pop("model_path", None)
     return _fingerprint(
         {
+            "tokenizer_behavior_version": TOKENIZER_BEHAVIOR_VERSION,
             "tokenizer": tokenizer_config,
             "data_files": data_signature(config, "tokenizer"),
             "data_sources": config["data"].get("sources") or [],
@@ -326,7 +489,7 @@ def analysis_fingerprint(config: dict[str, Any]) -> str:
         {
             "data": config["data"],
             "data_files": data_signature(config, "pretrain"),
-            "tokenizer_model": _file_signature(config["tokenizer"]["model_path"]),
+            "tokenizer_model": _file_content_signature(config["tokenizer"]["model_path"]),
         }
     )
 
@@ -346,7 +509,7 @@ def evaluation_fingerprint(config: dict[str, Any], checkpoint: str | Path) -> st
         "evaluation_dataset_type": dataset_type,
         "data": config["data"],
         "data_files": data_signature(config, dataset_type),
-        "tokenizer_model": _file_signature(config["tokenizer"]["model_path"]),
+        "tokenizer_model": _file_content_signature(config["tokenizer"]["model_path"]),
         "model_limits": {
             "max_seq_len": config["model"]["max_seq_len"],
             "max_position_embeddings": config["model"]["max_position_embeddings"],
@@ -361,7 +524,8 @@ def evaluation_fingerprint(config: dict[str, Any], checkpoint: str | Path) -> st
             else None
         ),
         "knowledge_generation": {
-            "protocol_version": 1,
+            "protocol_version": REASONING_GENERATION_PROTOCOL_VERSION,
+            "seed": config["run"].get("seed"),
             "reasoning": config["reasoning"],
             "reasoning_prompt_file": (
                 _file_content_signature(reasoning_prompt_file) if reasoning_prompt_file else None
@@ -388,13 +552,17 @@ def inference_fingerprint(config: dict[str, Any], checkpoint: str | Path) -> str
         prompt_files.append(config["reasoning"]["scratchpad_instruction_file"])
     payload = {
         "checkpoint": checkpoint_fingerprint(checkpoint),
-        "tokenizer_model": _file_signature(config["tokenizer"]["model_path"]),
+        "tokenizer_model": _file_content_signature(config["tokenizer"]["model_path"]),
+        "reasoning_generation_protocol_version": REASONING_GENERATION_PROTOCOL_VERSION,
+        "run": {"seed": config["run"].get("seed")},
         "inference": config["inference"],
         "reasoning": config["reasoning"],
+        "tokenizer_special_tokens": config["tokenizer"].get("special_tokens"),
+        "normalize_nfkc": config["data"].get("normalize_nfkc"),
         "hybrid_diffusion": config["hybrid_diffusion"],
         "experiments": config["experiments"],
         "cognitive_architecture": config["cognitive_architecture"],
-        "prompt_files": [_file_signature(path) for path in _expand_paths(prompt_files)],
+        "prompt_files": [_file_content_signature(path) for path in _expand_paths(prompt_files)],
         "truncation_policy": config["data"].get("truncation_policy"),
         "max_position_embeddings": config["model"]["max_position_embeddings"],
     }
@@ -405,17 +573,21 @@ def build_rejects_fingerprint(config: dict[str, Any], checkpoint: str | Path) ->
     """Fingerprint every input that determines generated preference rejects."""
 
     prompt_sources = config["dpo"].get("prompt_sources") or []
-    input_signature = data_signature(config, "sft") if prompt_sources else _file_signature(config["data"]["train_file"])
+    input_signature = (
+        data_signature(config, "sft") if prompt_sources else _file_content_signature(config["data"]["train_file"])
+    )
     reasoning_prompt_file = config["reasoning"].get("scratchpad_instruction_file")
     prompt_files = list(config["inference"].get("model_system_prompt_files") or [])
     if config["inference"].get("user_system_prompt_file"):
         prompt_files.append(config["inference"]["user_system_prompt_file"])
     return _fingerprint(
         {
+            "reasoning_generation_protocol_version": REASONING_GENERATION_PROTOCOL_VERSION,
             "input": input_signature,
             "prompt_sources": prompt_sources,
             "max_prompt_samples": config["dpo"].get("max_prompt_samples"),
             "checkpoint": checkpoint_fingerprint(checkpoint),
+            "tokenizer_model": _file_content_signature(config["tokenizer"]["model_path"]),
             "prompt_field": config["data"]["prompt_field"],
             "chosen_field": config["data"]["chosen_field"],
             "generation": config["dpo"].get("generate_rejected"),

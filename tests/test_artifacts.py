@@ -3,15 +3,20 @@ from __future__ import annotations
 import copy
 import json
 import math
+import os
 from pathlib import Path
 
 import pytest
 
 from llm_pipeline.artifacts import (
+    BUNDLE_TRANSACTION_VERSION,
     atomic_write_json,
     build_rejects_fingerprint,
     checkpoint_fingerprint,
     evaluation_fingerprint,
+    inference_fingerprint,
+    recover_file_bundle,
+    tokenizer_training_fingerprint,
     training_fingerprint,
 )
 from llm_pipeline.config import DEFAULT_CONFIG
@@ -71,6 +76,91 @@ def test_rejected_generation_fingerprint_tracks_reasoning_policy(tmp_path: Path)
     config["reasoning"]["max_reasoning_tokens"] += 1
 
     assert build_rejects_fingerprint(config, checkpoint) != before
+
+
+def test_inference_fingerprint_tracks_seed_controls_and_prompt_normalization(tmp_path: Path) -> None:
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+
+    baseline = inference_fingerprint(config, checkpoint)
+    config["run"]["seed"] += 1
+    changed_seed = inference_fingerprint(config, checkpoint)
+    config["tokenizer"]["special_tokens"]["reasoning_max"] = "<different-reasoning-max>"
+    changed_control = inference_fingerprint(config, checkpoint)
+    config["data"]["normalize_nfkc"] = not config["data"]["normalize_nfkc"]
+    changed_normalization = inference_fingerprint(config, checkpoint)
+
+    assert len({baseline, changed_seed, changed_control, changed_normalization}) == 4
+
+
+def test_training_fingerprint_tracks_tokenizer_bytes_with_unchanged_metadata(tmp_path: Path) -> None:
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    tokenizer_model = tmp_path / "tokenizer.model"
+    tokenizer_model.write_bytes(b"token-one")
+    original_stat = tokenizer_model.stat()
+    config["tokenizer"]["model_path"] = str(tokenizer_model)
+
+    before = training_fingerprint(config, "pretrain")
+    tokenizer_model.write_bytes(b"token-two")
+    os.utime(tokenizer_model, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    assert tokenizer_model.stat().st_size == original_stat.st_size
+    assert tokenizer_model.stat().st_mtime_ns == original_stat.st_mtime_ns
+    assert training_fingerprint(config, "pretrain") != before
+
+
+def test_tokenizer_training_fingerprint_tracks_numeric_contract() -> None:
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    before = tokenizer_training_fingerprint(config)
+    config["tokenizer"]["split_digits"] = False
+
+    assert tokenizer_training_fingerprint(config) != before
+
+
+def test_tokenizer_training_fingerprint_tracks_source_bytes_with_unchanged_metadata(tmp_path: Path) -> None:
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    source = tmp_path / "source.jsonl"
+    source.write_bytes(b'{"text":"row-one"}\n')
+    original_stat = source.stat()
+    config["data"]["sources"] = [{"name": "fixture", "path": str(source), "schema": "text"}]
+
+    before = tokenizer_training_fingerprint(config)
+    source.write_bytes(b'{"text":"row-two"}\n')
+    os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    assert source.stat().st_size == original_stat.st_size
+    assert source.stat().st_mtime_ns == original_stat.st_mtime_ns
+    assert tokenizer_training_fingerprint(config) != before
+
+
+def test_file_bundle_recovery_rolls_back_interrupted_promotion(tmp_path: Path) -> None:
+    target = tmp_path / "bundle"
+    target.mkdir()
+    (target / "model.bin").write_bytes(b"new-model")
+    (target / "config.json").write_bytes(b"old-config")
+    (target / "new-evidence.json").write_bytes(b"partial-new-evidence")
+    transaction_root = tmp_path / ".bundle.bundle-synthetic"
+    backup = transaction_root / "backup"
+    backup.mkdir(parents=True)
+    (transaction_root / "incoming").mkdir()
+    (backup / "model.bin").write_bytes(b"old-model")
+    journal = {
+        "version": BUNDLE_TRANSACTION_VERSION,
+        "target": str(target.resolve()),
+        "transaction_root": str(transaction_root.resolve()),
+        "names": ["model.bin", "config.json", "new-evidence.json"],
+        "previous_names": ["model.bin", "config.json"],
+    }
+    journal_path = tmp_path / ".bundle.bundle.transaction.json"
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+    assert recover_file_bundle(target)
+    assert (target / "model.bin").read_bytes() == b"old-model"
+    assert (target / "config.json").read_bytes() == b"old-config"
+    assert not (target / "new-evidence.json").exists()
+    assert not journal_path.exists()
+    assert not transaction_root.exists()
 
 
 def test_tensorboard_setting_writes_real_event_data(tmp_path: Path) -> None:
