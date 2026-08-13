@@ -1,0 +1,14 @@
+torch>=2.3,<3
+numpy>=1.26
+pyyaml>=6.0
+tqdm>=4.66
+sentencepiece>=0.2.0
+safetensors>=0.4.3
+tensorboard>=2.16
+psutil>=5.9
+
+# Optional acceleration / compression packages:
+# flash-attn is Linux/CUDA-version-sensitive and is usually installed from
+# the official project instructions, not blindly through this requirements file.
+# bitsandbytes, auto-gptq, or awq can be installed separately when those
+# quantization backends are needed.
