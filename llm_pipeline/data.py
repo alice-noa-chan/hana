@@ -6,14 +6,17 @@ import glob
 import hashlib
 import json
 import math
+import os
 import pickle
 import random
 import shutil
 import statistics
 import sys
+import time
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 
@@ -833,10 +836,20 @@ def tokenize_training_samples(
         iterable = samples
     output = list(iter_tokenized_training_samples(iterable, tokenizer, config, assistant_only_loss))
     if cache_path is not None:
-        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        with tmp_path.open("wb") as handle:
-            pickle.dump(output, handle, protocol=pickle.HIGHEST_PROTOCOL)
-        tmp_path.replace(cache_path)
+        temporary = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+        try:
+            with temporary.open("wb") as handle:
+                pickle.dump(output, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            for attempt in range(20):
+                try:
+                    os.replace(temporary, cache_path)
+                    break
+                except PermissionError:
+                    if attempt == 19:
+                        raise
+                    time.sleep(0.01 * (attempt + 1))
+        finally:
+            temporary.unlink(missing_ok=True)
     return output
 
 

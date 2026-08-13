@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier, local
 
 import pytest
 import torch
@@ -39,6 +41,18 @@ class FakeTokenizer:
         return [self.bos_id, *ids, self.eos_id] if add_special_tokens else ids
 
 
+class ConcurrentFakeTokenizer(FakeTokenizer):
+    def __init__(self, barrier: Barrier) -> None:
+        self.barrier = barrier
+        self.thread_state = local()
+
+    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
+        if not getattr(self.thread_state, "synchronized", False):
+            self.thread_state.synchronized = True
+            self.barrier.wait(timeout=5)
+        return super().encode(text, add_special_tokens)
+
+
 def test_clean_text_normalizes_and_preserves_pipeline_tokens() -> None:
     value = clean_text("  \uff21\x00 <b>hello</b> <assistant>  ")
     assert value == "A hello <assistant>"
@@ -71,6 +85,21 @@ def test_token_cache_key_changes_when_audit_digest_changes(tmp_path: Path) -> No
     after = token_shard_cache_key(config, tokenizer, "train", "pretrain", False)
 
     assert before != after
+
+
+def test_token_cache_publish_is_safe_for_concurrent_ddp_style_writers(tmp_path: Path) -> None:
+    config = load_config(ROOT / "configs/smoke.yaml").mutable_copy()
+    cache_dir = tmp_path / "token_cache"
+    config["data"]["token_cache_dir"] = str(cache_dir)
+    samples = [TextSample("synthetic concurrent cache record")]
+    tokenizer = ConcurrentFakeTokenizer(Barrier(2))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: tokenize_training_samples(samples, tokenizer, config), range(2)))
+
+    assert results[0] == results[1]
+    assert len(list(cache_dir.glob("tokens_*.pkl"))) == 1
+    assert list(cache_dir.glob("*.tmp")) == []
 
 
 def test_in_memory_deduplication_keeps_first_sample() -> None:
