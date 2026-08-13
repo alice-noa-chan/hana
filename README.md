@@ -41,10 +41,12 @@ The code provides:
 6. SentencePiece tokenizer training with provenance
 7. pretraining, supervised fine-tuning, and DPO
 8. checkpoint save, resume, and freshness checks
-9. evaluation and inference entry points
-10. full-precision and dynamic INT8 export
-11. CPU and distributed smoke-test paths
-12. experiment-contract validation for architecture, portability, and systems studies
+9. bounded hidden-reasoning and answer-only inference
+10. a contamination-aware private multiple-choice pilot
+11. evaluation and inference entry points
+12. full-precision and dynamic INT8 export
+13. CPU and distributed smoke-test paths
+14. experiment-contract validation for architecture, portability, and systems studies
 
 The public `config.yaml` intentionally contains no source entries, no private language list, no persona prompt paths, and no DPO prompt-source names.
 
@@ -216,6 +218,7 @@ DPO is disabled in the public configuration. A private override must enable it a
 | Validate the public repository | `hana verify` |
 | Lock private sources | `hana data lock --config config.yaml` |
 | Audit private sources | `hana data audit --config config.yaml` |
+| Quarantine a private evaluation pilot | `hana data quarantine-eval --config config.yaml` |
 | Check environment and evidence | `hana doctor --config config.yaml --allow-cpu` |
 | Run one stage | `hana run --config config.yaml --mode pretrain` |
 | Continue the pipeline | `hana run --config config.yaml --mode auto --continue` |
@@ -236,7 +239,94 @@ tokenizer: false
 
 The pipeline excludes evaluation sources from tokenizer training, pretraining, SFT, and DPO even when ordinary source-policy enforcement is disabled. It also rejects a path or byte-identical file assigned to both training and evaluation.
 
-An evaluation-source declaration is quarantine metadata. The generic evaluation stage does not automatically execute a third-party benchmark. The operator must use a separate licensed evaluator and must never route its content into a training source.
+An evaluation-source declaration is quarantine metadata. It does not automatically execute a third-party benchmark. The fixed private knowledge pilot described below is the only built-in multiple-choice adapter, and it reads a separate ignored file only when explicitly enabled. Every other official suite still needs an isolated, licensed evaluator.
+
+## Hidden reasoning
+
+Reasoning is a real two-phase generation path, not only a label placed in front of a prompt.
+
+1. `off` performs one ordinary answer pass.
+2. `low`, `medium`, and `high` generate a bounded private scratchpad first.
+3. The final answer continues from the same token context after a reasoning boundary.
+4. The normal `generate()` method returns the final answer only.
+
+The public defaults allocate 25%, 50%, and 100% of `max_reasoning_tokens` to low, medium, and high effort. These budgets are upper bounds. The position-limit guard reserves room for the final answer before the scratchpad is generated.
+
+By default, the scratchpad is absent from the returned answer, token trace, cognitive memory, and inference JSON. Set `expose_reasoning_trace: true` only for a deliberate local inspection. Set `save_reasoning_trace: true` only when raw private traces may be written under the ignored run-log directory. A saved trace may contain sensitive or incorrect text and must never be published automatically.
+
+A private SFT message may teach the protocol with optional fields:
+
+```json
+{
+  "role": "assistant",
+  "reasoning_mode": "high",
+  "reasoning": "<private intermediate target>",
+  "content": "<private final target>"
+}
+```
+
+Instruction-style sources may map different local column names through `reasoning_field` and `reasoning_mode_field`. The loader escapes control-token injection in both the scratchpad and final answer. Ordinary answer-only messages continue to use the normal assistant format.
+
+Keep all reasoning targets private. Never use benchmark questions, official explanations, answer keys, or traces generated from held-out benchmark items as reasoning SFT data.
+
+The default reasoning instruction is English and neutral. For natural Korean, Japanese, or another language, put a language-appropriate instruction in an ignored local text file and set `reasoning.scratchpad_instruction_file` in `config.local.yaml`. The path is removed from checkpoint-safe configuration artifacts.
+
+Hidden reasoning is an application-output boundary, not a mathematical guarantee that a model can never paraphrase part of its scratchpad in a final answer. Safety evaluation must test that behavior directly.
+
+## Private ten-item knowledge pilot
+
+The initial measurable target is ten correct answers on one frozen, private ten-item pilot. This is a narrow integration and development target. A result of 10/10 on ten questions is not evidence of broad benchmark capability because the sample is too small.
+
+The public repository contains no questions or answers. Prepare one ignored local JSONL file with exactly these fields on every row:
+
+```json
+{
+  "id": "<private stable id>",
+  "question": "<private question>",
+  "choices": {
+    "A": "<private choice>",
+    "B": "<private choice>",
+    "C": "<private choice>",
+    "D": "<private choice>"
+  },
+  "answer": "<private correct label>"
+}
+```
+
+Enable it only in the ignored `config.local.yaml`:
+
+```yaml
+schema_version: 2
+
+eval:
+  knowledge_pilot:
+    enabled: true
+    file: "./train_data/eval/private-pilot.local.jsonl"
+    prompt_file: "./train_data/eval/prompt.local.txt"
+    item_count: 10
+    required_correct: 10
+    choice_labels: ["A", "B", "C", "D"]
+    reasoning_mode: "high"
+    max_new_tokens: 8
+    require_denylist_coverage: true
+```
+
+`prompt_file` is optional. When it is present, it must use the placeholders `{labels}`, `{question}`, and `{choices}`. This lets a Korean pilot use a natural Korean instruction and a Japanese pilot use a natural Japanese instruction without placing non-English private prompts in the public repository.
+
+Run the safe sequence:
+
+```powershell
+hana data quarantine-eval --config config.yaml
+hana data lock --config config.yaml
+hana data audit --config config.yaml
+hana run --config config.yaml --mode eval --force
+```
+
+The quarantine command adds canonical hashes for each question and full rendered prompt to the ignored benchmark denylist. Evaluation refuses to load the model when required hashes are missing. Changing the pilot file, its prompt template, the denylist, the checkpoint, or reasoning settings invalidates the cached result.
+
+Generation is deterministic: temperature is zero, top-p is one, top-k is disabled, and repetition penalty is one. Cognitive memory, activation experiments, token traces, and reasoning-trace persistence are disabled for the pilot. The knowledge pilot contributes only the item count, correct count, accuracy, parse rate, and pass/fail status to the normal evaluation result. It does not contribute questions, choices, answers, model outputs, or scratchpads.
+
+Official benchmark material may be evaluated only when its license permits that use. It must remain outside tokenizer, pretraining, SFT, DPO, replay, memory, and retrieval inputs. Improving this pilot must come from reviewed non-benchmark knowledge and reasoning data, not from memorizing the ten held-out items.
 
 ## Reusable data-pack boundary
 

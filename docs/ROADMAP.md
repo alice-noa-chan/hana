@@ -53,7 +53,7 @@ The ranges are planning ranges. They are not instructions to pad a corpus with w
 | Gate | Candidate active parameters | Cumulative accepted pretraining tokens | Main capability gate |
 |---|---:|---:|---|
 | Current architecture | 303M | Private and unpublished | Establish clean, reproducible local measurements |
-| 1A | 303M | 8.5B-10B | Stable Hana identity; at least 30% on private JLPT-style and TOPIK-style suites |
+| 1A | 303M | 8.5B-10B | Stable Hana identity; at least 30% on private JLPT-style and TOPIK-style suites; 10/10 on the frozen private knowledge pilot |
 | 1B | 303M-420M | 12B-16B | At least 50% on both private language suites without identity regression |
 | 2A | 500M-650M | 20B-28B | Strong elementary and lower-secondary knowledge in Korean and Japanese |
 | 2B | 750M-1.0B | 32B-45B | High-school-senior knowledge coverage while the persona remains nine |
@@ -82,8 +82,13 @@ Required checks include:
 - safety refusals remain short, kind, and clear
 - private JLPT-style item accuracy reaches 30%
 - private TOPIK-style item accuracy reaches 30%
+- the frozen private ten-item knowledge pilot reaches 10/10
 
 The percentages are raw accuracy on private development suites. They are not official JLPT or TOPIK scaled scores and are not described as an official pass.
+
+The ten-item pilot is deliberately small. It proves that the first checkpoint can complete one isolated Korean multiple-choice path and meet one fixed development target. It does not prove broad KMMLU capability. The pilot contributes only `correct_count/10`, accuracy, parse rate, and pass/fail status to the normal evaluation report. Later gates require a much larger, stratified private suite.
+
+The pilot is frozen before the final training-corpus audit. Its questions, choices, answers, explanations, translations, generated scratchpads, and paraphrases never become tokenizer, pretraining, SFT, DPO, replay, memory, or retrieval input.
 
 ### Gate 1B: language foundation
 
@@ -118,6 +123,14 @@ This gate adds independently generated and reviewed tasks for:
 - writing a small function that passes hidden unit tests
 
 Gate 3 requires a future restricted code evaluator. That evaluator must execute generated code against hidden tests. After it exists, a plausible-looking answer will not count as correct when it fails those tests.
+
+### Reasoning protocol across gates
+
+Reasoning is introduced as a bounded private scratchpad followed by a separate final-answer phase. The protocol is available at Gate 1A, but its value must be measured rather than assumed.
+
+Every reasoning report compares at least `off` and one enabled mode on the same frozen items. It records final-answer accuracy, parse failures, scratchpad tokens, final-answer tokens, wall time, peak memory, and any trace leakage into the visible answer. A reasoning mode is not promoted when it only produces longer text without improving final answers.
+
+Reasoning SFT may use reviewed non-benchmark problems and human-checked intermediate targets. Benchmark rationales and traces generated from held-out benchmark questions are prohibited. Scratchpads are hidden by default and are never treated as calibrated confidence or a guaranteed faithful explanation of model computation.
 
 ### Gate 4: Korean language reasoning at 50 points
 
@@ -180,7 +193,7 @@ tokenizer: false
 
 The pipeline rejects an evaluation source from tokenizer, pretraining, SFT, and DPO selection even when normal license-policy enforcement is disabled. It also rejects a path or byte-identical file shared by training and evaluation.
 
-This declaration is quarantine metadata. The current generic evaluation stage does not automatically execute a `purpose: evaluation` source. An official suite therefore needs a separate, isolated evaluator that follows its license. That evaluator must never add its content to `data.sources` used for training.
+This declaration is quarantine metadata. The generic evaluation stage does not automatically execute a `purpose: evaluation` source. The built-in knowledge pilot reads only its explicitly configured ignored file, requires denylist coverage, and writes aggregate metrics only. Every other official suite needs a separate, isolated evaluator that follows its license. No evaluator may add its content to `data.sources` used for training.
 
 The private benchmark denylist stores exact normalized component hashes. Matching collapses whitespace and applies Unicode-aware case folding before SHA-256. It does not find paraphrases, substrings, or semantically similar text. The filter checks raw message, translation, prompt, chosen, and rejected fields, but every passage, question, choice, answer, rationale, translation, and reformatted variant still needs its own hash. Human contamination review remains required.
 
