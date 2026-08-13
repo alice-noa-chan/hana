@@ -1,0 +1,27 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality-and-cpu-ddp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - name: Prepare generated synthetic smoke input
+        run: python scripts/prepare_synthetic_smoke.py
+      - run: hana verify
+      - name: Prepare tiny tokenizer
+        run: python -m llm_pipeline run --config configs/smoke.yaml --mode train_tokenizer --force
+      - name: Linux CPU Gloo DDP smoke
+        run: torchrun --standalone --nproc_per_node=2 -m llm_pipeline run --config configs/smoke.yaml --mode pretrain --force
