@@ -29,7 +29,11 @@ The small robot in the illustration is Hana's companion. It is not Hana's identi
 
 ## What the public repository contains
 
-The checked-in architecture is a decoder-only Transformer with exactly 303,350,784 parameters when built with the published production dimensions and 32,000-token vocabulary.
+The checked-in architecture is a decoder-only Transformer with exactly 303,353,856 parameters when built with the published production dimensions and 32,000-token vocabulary. The count includes QK normalization in every attention layer.
+
+Two paper-inspired architecture experiments are implemented but disabled. `model.attention_output_gate` adds one query-dependent sigmoid scalar per attention head after attention and before the output projection. At the published dimensions it adds 24,960 parameters. Its weights start at zero and `attention_output_gate_bias: 2.0` starts every gate at about 0.881, avoiding a random half-scale perturbation at initialization. `model.sliding_window.layer_pattern` can repeat an exact schedule such as `[full, sliding, sliding, sliding]` while keeping the same model weights and full KV-cache shape. The current sliding implementation uses an exact mask but retains every cached key and value and may still use dense SDPA work. It is therefore a quality and locality experiment, not a claimed speed or memory optimization. Both candidates require a controlled architecture-ablation contract before promotion.
+
+QK normalization and the output gate add checkpoint tensors, so their values must match the checkpoint architecture. The layer pattern adds no tensors and can reuse weights for evaluation, but changing its masks still changes model behavior and invalidates cached results.
 
 The code provides:
 
@@ -41,7 +45,7 @@ The code provides:
 6. SentencePiece tokenizer training with provenance
 7. pretraining, supervised fine-tuning, and DPO
 8. checkpoint save, resume, and freshness checks
-9. bounded hidden-reasoning and answer-only inference
+9. five-level hidden reasoning with a bounded maximum-effort search mode
 10. a contamination-aware private multiple-choice pilot
 11. evaluation and inference entry points
 12. full-precision and dynamic INT8 export
@@ -66,6 +70,8 @@ The following material must remain outside Git:
 - benchmark questions, passages, choices, answers, explanations, or derivatives
 
 The `.gitignore` file protects common local roots and artifact formats. The repository verification command also rejects listed private paths and artifact formats if they are force-added.
+
+The automated publication check catches structural warning signs such as private directories, artifact formats, local configuration files, personal absolute paths, literal evidence hashes, and non-placeholder source URLs in public YAML. It is not a universal classifier for every dataset title, provider name, download link, or training recipe that someone could write in prose or a code comment. Before publishing a change, a human reviewer must still inspect every changed document, comment, and configuration example for real source identities, links, recipes, and run-specific statistics.
 
 ## Requirements
 
@@ -243,14 +249,31 @@ An evaluation-source declaration is quarantine metadata. It does not automatical
 
 ## Hidden reasoning
 
-Reasoning is a real two-phase generation path, not only a label placed in front of a prompt.
+Reasoning is a real two-phase generation path, not only a label placed in front of a prompt. The final answer continues from the same token context after a private reasoning boundary. The normal `generate()` method still returns only a string containing the final answer.
 
-1. `off` performs one ordinary answer pass.
-2. `low`, `medium`, and `high` generate a bounded private scratchpad first.
-3. The final answer continues from the same token context after a reasoning boundary.
-4. The normal `generate()` method returns the final answer only.
+| Mode | Behavior |
+|---|---|
+| `off` | One direct answer pass and no scratchpad. |
+| `low` | One private scratchpad with 25% of `max_reasoning_tokens`. |
+| `medium` | One private scratchpad with 50% of the limit. |
+| `high` | One private scratchpad with 75% of the limit. |
+| `max` | The full scratchpad limit plus configurable multi-candidate test-time search. |
 
-The public defaults allocate 25%, 50%, and 100% of `max_reasoning_tokens` to low, medium, and high effort. These budgets are upper bounds. The position-limit guard reserves room for the final answer before the scratchpad is generated.
+These values are upper bounds, not requested output lengths or quality grades. Generation may stop early. A larger budget is useful only when measured final-answer quality improves. The position-limit guard reserves room for the final answer before a scratchpad is generated.
+
+### Maximum effort
+
+`max` is a Hana experiment. It is not a decoding method claimed by any cited paper. With the public defaults it generates three independently sampled reasoning-and-answer candidates using `temperature: 1.0` and `top_p: 0.95`. The candidate count is configurable from 2 through 26, but time and token use grow roughly in proportion to that count.
+
+A strict majority of normalized final answers wins. When no strict majority exists, the same local model runs a deterministic private selector. That selector sees the original request and bounded copies of the candidate final answers. It never sees candidate scratchpads. An invalid selector response, or a selector prompt that cannot fit the context, falls back to the earliest candidate.
+
+Each candidate receives a local random-number stream derived from the reasoning protocol version, `run.seed`, the canonical prompt, and the candidate index. Candidate sampling does not reseed or consume the global PyTorch random-number stream. Reproducibility means a repeat with the same model, tokenizer, code, device, and sampling backend. It is not a promise of bit-identical output across different hardware or PyTorch backends.
+
+An active `noise` activation intervention uses a separate stochastic operation. The seeded `max` path therefore refuses to run while that intervention is active. Disable the noise intervention or use a single-candidate mode. Deterministic activation interventions remain available.
+
+The inference artifact separates generated-token accounting into `reasoning_compute_tokens`, `answer_compute_tokens`, and `selector_compute_tokens`. The first value includes every token sampled during every candidate reasoning phase, including a naturally generated reasoning boundary or end token. The second includes final-answer tokens from all candidates. The third includes tokens decoded by the private selector. Their sum is the generated-token count for the search. It does not include prompt tokens or a boundary inserted by code when the model did not generate one.
+
+Only the selected final answer may reach the ordinary return value or cognitive memory. Losing answers, losing scratchpads, and selector inputs remain ephemeral. They are absent from the default token trace, inference JSON, and memory store. If trace exposure or persistence is explicitly enabled, only the selected scratchpad is eligible for that private local output.
 
 By default, the scratchpad is absent from the returned answer, token trace, cognitive memory, and inference JSON. Set `expose_reasoning_trace: true` only for a deliberate local inspection. Set `save_reasoning_trace: true` only when raw private traces may be written under the ignored run-log directory. A saved trace may contain sensitive or incorrect text and must never be published automatically.
 
@@ -259,7 +282,7 @@ A private SFT message may teach the protocol with optional fields:
 ```json
 {
   "role": "assistant",
-  "reasoning_mode": "high",
+  "reasoning_mode": "max",
   "reasoning": "<private intermediate target>",
   "content": "<private final target>"
 }
@@ -270,6 +293,8 @@ Instruction-style sources may map different local column names through `reasonin
 Keep all reasoning targets private. Never use benchmark questions, official explanations, answer keys, or traces generated from held-out benchmark items as reasoning SFT data.
 
 The default reasoning instruction is English and neutral. For natural Korean, Japanese, or another language, put a language-appropriate instruction in an ignored local text file and set `reasoning.scratchpad_instruction_file` in `config.local.yaml`. The path is removed from checkpoint-safe configuration artifacts.
+
+Evaluation reports should compare `off`, `high`, and `max` on the same frozen prompts and seeds. Useful aggregate measurements include final-answer score, parse rate, majority and selector rates, selected-versus-first accuracy, total generated tokens, wall time, throughput, peak memory, safety failures, and visible trace leakage. Raw prompts, candidates, and scratchpads remain private.
 
 Hidden reasoning is an application-output boundary, not a mathematical guarantee that a model can never paraphrase part of its scratchpad in a final answer. Safety evaluation must test that behavior directly.
 
@@ -306,7 +331,7 @@ eval:
     item_count: 10
     required_correct: 10
     choice_labels: ["A", "B", "C", "D"]
-    reasoning_mode: "high"
+    reasoning_mode: "max"
     max_new_tokens: 8
     require_denylist_coverage: true
 ```
@@ -324,7 +349,7 @@ hana run --config config.yaml --mode eval --force
 
 The quarantine command adds canonical hashes for each question and full rendered prompt to the ignored benchmark denylist. Evaluation refuses to load the model when required hashes are missing. Changing the pilot file, its prompt template, the denylist, the checkpoint, or reasoning settings invalidates the cached result.
 
-Generation is deterministic: temperature is zero, top-p is one, top-k is disabled, and repetition penalty is one. Cognitive memory, activation experiments, token traces, and reasoning-trace persistence are disabled for the pilot. The knowledge pilot contributes only the item count, correct count, accuracy, parse rate, and pass/fail status to the normal evaluation result. It does not contribute questions, choices, answers, model outputs, or scratchpads.
+Direct pilot decoding uses temperature zero, top-p one, no top-k sampling, and a repetition penalty of one. When the pilot selects `max`, the inner candidates instead use the stable, locally seeded maximum-effort sampling policy described above; the selector remains deterministic. Cognitive memory, activation experiments, token traces, and reasoning-trace persistence stay disabled. The knowledge pilot contributes only item count, correct count, accuracy, parse rate, and pass/fail status to the normal evaluation result. It contributes no question, choice, answer key, model output, candidate, selector input, or scratchpad.
 
 Official benchmark material may be evaluated only when its license permits that use. It must remain outside tokenizer, pretraining, SFT, DPO, replay, memory, and retrieval inputs. Improving this pilot must come from reviewed non-benchmark knowledge and reasoning data, not from memorizing the ten held-out items.
 
@@ -339,6 +364,22 @@ The model and trainer are language-neutral. Identity and data are separate:
 - deterministic `sample_rate` provides basic source downsampling.
 
 Training a fresh tokenizer for another private pack is supported. Expanding the vocabulary of an existing checkpoint is not currently supported because checkpoint tensor loading is strict. Continued language expansion therefore needs either a stable broad tokenizer or a separately tested token-ID and embedding migration.
+
+### Tokenizer numeric integrity
+
+`split_digits: true` is a tokenizer-training decision. It asks SentencePiece to keep each decimal digit as its own piece, so an accidental vocabulary chunk such as `2026` cannot be the only learned representation for that number. It is not an inference-time arithmetic solver and does not guarantee mathematically correct answers.
+
+Tokenizer training and corpus finalization use the same trainer settings and the same validation gate. Before a candidate tokenizer replaces the current local tokenizer, it must satisfy all of these checks:
+
+1. code-owned probes cover integers, leading zeroes, signs, decimals, exponents, percentages, dates, times, currency, radix prefixes, long identifiers, and numbers inside Korean and Japanese text
+2. every probe decodes to its explicitly expected canonical form after configured Unicode normalization
+3. no ordinary, non-byte vocabulary piece contains more than one Unicode decimal digit
+4. no probe produces the unknown-token ID while byte fallback is enabled
+5. a bounded deterministic sample from the private tokenizer corpus produces no unknown-token ID and a non-empty round trip
+
+Logs and validation artifacts contain only aggregate counts, model and probe-suite digests, and pass/fail status. They never print a private corpus row. The tokenizer model SHA-256 is included in cache and pipeline freshness decisions, so replacing a model while preserving its size and timestamp cannot reuse stale token shards.
+
+Changing digit splitting, normalization, vocabulary, special tokens, or tokenizer corpus requires a freshly trained tokenizer. Existing checkpoints cannot safely reuse changed token IDs or embedding rows. A different grouping policy, such as one-to-three-digit pieces, is a separate tokenizer experiment and must use fresh model training under a `data_portability` contract.
 
 ## Research claims require contracts
 
@@ -422,6 +463,16 @@ Private data roots, profiles, prompts, tokenizers, checkpoints, and run evidence
 - The full-size configuration still requires private hardware validation and capacity planning.
 - Experimental structures need fair ablations before promotion.
 - Dynamic INT8 export currently relies on PyTorch's dynamic quantization API.
+
+## Research influences
+
+The supplied reports are used as design references, not as proof that Hana inherits their results.
+
+- [Kimi K3](https://arxiv.org/abs/2607.24653) provides user-facing reasoning-effort levels and reports a maximum-effort reasoning setup using temperature 1.0 and top-p 0.95. It also studies hybrid sequence mixing and attention across depth. The reasoning settings inform Hana's `max` interface; the larger KDA, MLA, and depth-routing structures remain future experiments.
+- [Solar Open 2](https://arxiv.org/abs/2607.20062) combines gated full attention with linear-attention layers, uses a byte-level tokenizer with digit splitting, and emphasizes verifier-first construction for agent tasks. Hana's small gate and layer schedule are bounded studies, not a reproduction of its recurrent attention.
+- [K-EXAONE 2.0](https://arxiv.org/abs/2608.04505) retains QK normalization and a repeating global/sliding attention layout. It also filters redundant self-reflection and disproportionately long reasoning trajectories. These choices inform Hana's normalized baseline, optional layer schedule, and treatment of reasoning budgets as compute limits rather than quality ranks.
+- [Motif 3](https://arxiv.org/abs/2608.09119) applies query-dependent attention output gating and uses bounded numeric grouping. Its attention and one-to-three-digit tokenizer rules remain separate research arms; Hana currently keeps ordinary GQA and single-digit splitting.
+- [A.X K2](https://github.com/SKT-AI/A.X-K2/blob/main/A_X_K2_Tech_Report.pdf) combines QK normalization with head-specific gated attention and trains one model to support thinking and non-thinking control modes. Hana uses the first as a baseline and the gate as an opt-in ablation, while evaluating safety separately at every effort level.
 
 ## Further reading
 

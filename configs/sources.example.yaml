@@ -94,6 +94,8 @@ sources:
     output_field: "final_answer"
     reasoning_field: "private_reasoning"
     reasoning_mode_field: "reasoning_mode"
+    # Allowed values are off, low, medium, high, and max. A row with a private
+    # reasoning target normally uses low through max; off is answer-only.
     # Reasoning targets must be independently authored or licensed training
     # material. Never derive them from held-out benchmark items.
     provenance:

@@ -19,15 +19,16 @@ The repository describes the software honestly. Inside persona conversations, Ha
 
 ## Published architecture baseline
 
-The public configuration defines architecture only:
+The public configuration defines the architecture and data-free pipeline defaults:
 
 | Item | Current value |
 |---|---:|
-| Exact model parameters | 303,350,784 |
+| Exact model parameters | 303,353,856 |
 | Decoder layers | 24 |
 | Hidden size | 1,024 |
 | Attention heads | 16 |
 | Key-value heads | 4 |
+| QK normalization | Enabled |
 | Vocabulary size | 32,000 |
 | Maximum training sequence | 2,048 tokens |
 
@@ -102,6 +103,18 @@ Every report includes:
 - tokenizer characters per token and UTF-8 bytes per token for each declared language
 - identity and safety regression results
 
+### Numeric tokenizer gate
+
+The tokenizer must pass its numeric-integrity gate before any model-training stage begins.
+
+- `split_digits`, Unicode normalization, vocabulary size, and every special token are explicit configuration inputs.
+- Fixed synthetic probes must round-trip to their expected canonical text and produce no unknown-token ID.
+- A bounded deterministic private-corpus sample must also produce no unknown-token ID and a non-empty round trip.
+- Public evidence contains only aggregate counts and opaque digests. It never includes a private probe row.
+- Any tokenizer-setting or tokenizer-byte change invalidates token caches and downstream artifact fingerprints.
+
+Single-digit splitting is the first baseline. One-to-three-digit grouping, as used by Motif 3, is a separate research candidate. Comparing the two requires freshly trained tokenizers and models under a `data_portability` contract. A changed tokenizer may not be inserted into an existing checkpoint unless a future embedding-migration experiment proves token-ID compatibility.
+
 ### Gates 2A and 2B: broader knowledge
 
 These gates grow in two steps so the jump is measurable.
@@ -128,7 +141,27 @@ Gate 3 requires a future restricted code evaluator. That evaluator must execute 
 
 Reasoning is introduced as a bounded private scratchpad followed by a separate final-answer phase. The protocol is available at Gate 1A, but its value must be measured rather than assumed.
 
-Every reasoning report compares at least `off` and one enabled mode on the same frozen items. It records final-answer accuracy, parse failures, scratchpad tokens, final-answer tokens, wall time, peak memory, and any trace leakage into the visible answer. A reasoning mode is not promoted when it only produces longer text without improving final answers.
+| Mode | Gate behavior |
+|---|---|
+| `off` | One direct final-answer pass. |
+| `low` | One private path with 25% of the configured scratchpad limit. |
+| `medium` | One private path with 50% of the limit. |
+| `high` | One private path with 75% of the limit. |
+| `max` | Full per-path limit plus configurable seeded candidates, strict majority, and a final-answer-only private selector when needed. |
+
+Budgets control maximum compute. They do not request long prose or promise quality. `max` is promoted only when its selected-answer improvement justifies multiple complete candidate generations and possible selector overhead. Majority voting and the private selector are Hana experiments, not paper replications.
+
+Every reasoning report compares at least `off`, `high`, and `max` on the same frozen prompts and seeds. It records:
+
+- final-answer quality and parse rate
+- selected-versus-first-candidate accuracy
+- majority, selector, invalid-selector, and context-fallback rates
+- selected scratchpad tokens and generated reasoning, answer, and selector tokens, with their exact accounting rules
+- wall time, throughput, peak memory, and compute multiplier over `off`
+- safety regressions and visible reasoning leakage
+- reasoning protocol version, seed, checkpoint, tokenizer fingerprint, backend, dtype, device, and hardware
+
+Only aggregate measurements may enter public evidence. Raw prompts, candidate answers, scratchpads, and selector inputs remain private. A reasoning mode is not promoted when it only produces longer text without improving final answers. Deterministic, symbolic, or executable verifiers take precedence over self-selection whenever an exact checker exists.
 
 Reasoning SFT may use reviewed non-benchmark problems and human-checked intermediate targets. Benchmark rationales and traces generated from held-out benchmark questions are prohibited. Scratchpads are hidden by default and are never treated as calibrated confidence or a guaranteed faithful explanation of model computation.
 
@@ -234,6 +267,16 @@ Candidate areas include:
 - quantization-aware designs
 - compilation, kernels, batching, and cache layouts
 - combinations that reduce memory traffic or serial decoding work
+
+The first bounded architecture studies are intentionally smaller than a new MoE, latent-attention, or recurrent-attention backbone:
+
+| Candidate | Public default | Exact structural effect | Required evidence |
+|---|---|---|---|
+| QK normalization | Enabled baseline | Adds 3,072 scale parameters at 303M and does not change KV-cache shapes. | Baseline stability, quality, throughput, and memory measurements. |
+| Head-specific attention output gate | Disabled | Adds 24,960 parameters at 303M and gates each head after attention. | Same-token-budget loss and language-quality gains without a harmful speed or stability regression. |
+| Repeating full/sliding schedule | Disabled | Changes masks per layer but does not change parameter count or the current full KV-cache shape. | Locality and quality results first; no speed or memory claim until a sparse kernel and compact cache are measured. |
+
+The gate and hybrid schedule are prior-art extensions inspired by the supplied model reports. They are not described as Hana inventions. Larger changes such as MLA, KDA, sparse MoE routing, or multi-stream residual connections remain future studies because they change checkpoint structure, cache formats, kernels, and training risk at the same time.
 
 Every candidate begins as `unverified_hypothesis`, `replication`, or `prior_art_extension`. A separate human-reviewed literature search is required before any novelty claim.
 
