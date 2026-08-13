@@ -177,6 +177,21 @@ def test_reasoning_message_uses_configured_default_and_rejects_invalid_mode() ->
         )
 
 
+def test_reasoning_message_supports_max_effort_control() -> None:
+    specials = {
+        "assistant": "<assistant>",
+        "reasoning_off": "<reasoning:off>",
+        "reasoning_max": "<reasoning:max>",
+    }
+
+    rendered, _ = render_messages(
+        [{"role": "assistant", "reasoning": "work", "reasoning_mode": "MAX", "content": "answer"}],
+        specials,
+    )
+
+    assert rendered == "<reasoning:max>\n<assistant>\nwork\n<reasoning:off>\nanswer\n"
+
+
 def test_source_and_field_helpers_use_explicit_precedence() -> None:
     source = {"format": "csv"}
     assert get_source_value(source, "format", "jsonl") == "csv"

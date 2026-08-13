@@ -30,6 +30,8 @@ class DecoderConfig:
     use_bias: bool
     gradient_checkpointing: bool
     qk_norm: bool
+    attention_output_gate: bool
+    attention_output_gate_bias: float
     logit_softcap: float
     z_loss_weight: float
     initializer_range: float
@@ -78,6 +80,8 @@ class DecoderConfig:
             use_bias=bool(model["use_bias"]),
             gradient_checkpointing=resolve_gradient_checkpointing(model),
             qk_norm=bool(model.get("qk_norm", False)),
+            attention_output_gate=bool(model.get("attention_output_gate", False)),
+            attention_output_gate_bias=float(model.get("attention_output_gate_bias", 2.0)),
             logit_softcap=float(model.get("logit_softcap", 0.0)),
             z_loss_weight=float(train.get("z_loss_weight", 0.0)),
             initializer_range=float(model.get("initializer_range", 0.02)),

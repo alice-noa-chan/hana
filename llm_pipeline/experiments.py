@@ -112,6 +112,20 @@ class ActivationExperiment:
     def set_phase(self, phase: str) -> None:
         self.phase = str(phase)
 
+    def has_active_stochastic_interventions(self) -> bool:
+        """Return whether an active intervention consumes an untracked RNG stream."""
+
+        if not self.enabled:
+            return False
+        for intervention in self.interventions:
+            start = int(intervention.get("start_step", 0))
+            end = intervention.get("end_step")
+            if self.step < start or (end is not None and self.step > int(end)):
+                continue
+            if str(intervention["kind"]) == "noise":
+                return True
+        return False
+
     def _active_interventions(self, module_name: str) -> list[dict[str, Any]]:
         active = []
         for intervention in self.interventions:
@@ -412,6 +426,7 @@ def _sample_block_logits(
     top_p: float,
     top_k: int,
     suppress_ids: set[int] | frozenset[int] | None,
+    generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     scores = logits.float().clone()
     if suppress_ids:
@@ -435,9 +450,11 @@ def _sample_block_logits(
             sorted_scores.masked_fill_(remove, -float("inf"))
             scores = torch.full_like(scores, -float("inf")).scatter(-1, sorted_indices, sorted_scores)
         probabilities = torch.softmax(scores, dim=-1)
-        tokens = torch.multinomial(probabilities.reshape(-1, probabilities.size(-1)), 1).reshape(
-            probabilities.shape[:-1]
-        )
+        tokens = torch.multinomial(
+            probabilities.reshape(-1, probabilities.size(-1)),
+            1,
+            generator=generator,
+        ).reshape(probabilities.shape[:-1])
     confidence = probabilities.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
     entropy = -(probabilities * probabilities.clamp_min(1e-12).log()).sum(dim=-1)
     return tokens, confidence, entropy
@@ -459,6 +476,7 @@ def hybrid_generate(
     repetition_penalty: float,
     suppress_ids: set[int] | frozenset[int] | None = None,
     trace: list[dict[str, Any]] | None = None,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Generate causally across blocks and denoise tokens in each block in parallel."""
 
@@ -481,6 +499,7 @@ def hybrid_generate(
         use_cache=True,
         suppress_ids=suppress_ids,
         trace=trace,
+        generator=generator,
     )
     if generated[0, input_ids.size(1) :].eq(eos_id).any():
         suffix_eos = torch.nonzero(generated[0, input_ids.size(1) :].eq(eos_id), as_tuple=False)[0]
@@ -516,7 +535,12 @@ def hybrid_generate(
                     )
                     block_logits[..., seen] = seen_scores
             tokens, proposed_confidence, entropy = _sample_block_logits(
-                block_logits, temperature, top_p, top_k, suppress_ids
+                block_logits,
+                temperature,
+                top_p,
+                top_k,
+                suppress_ids,
+                generator,
             )
             target_count = min(width, math.ceil(width * (denoise_step + 1) / denoise_steps))
             add_count = target_count - int(committed.sum().item())

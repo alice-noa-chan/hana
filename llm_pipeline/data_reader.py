@@ -28,9 +28,10 @@ PRESERVED_TAGS = {
     "<reasoning:low>",
     "<reasoning:medium>",
     "<reasoning:high>",
+    "<reasoning:max>",
     "<mask>",
 }
-REASONING_MODES = frozenset({"low", "medium", "high"})
+REASONING_MODES = frozenset({"low", "medium", "high", "max"})
 DEFAULT_REASONING_MODE = "medium"
 
 

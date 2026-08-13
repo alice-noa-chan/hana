@@ -130,6 +130,43 @@ def repeat_kv(x: torch.Tensor, repeats: int) -> torch.Tensor:
     return x.reshape(bsz, kv_heads * repeats, seq_len, head_dim)
 
 
+def resolve_layer_window(sliding_window: dict[str, Any], layer_index: int) -> int | None:
+    """Return this layer's local-attention window, or ``None`` for full attention.
+
+    An empty pattern preserves the original all-sliding behavior when sliding
+    attention is enabled.  A non-empty pattern repeats over decoder layers, so
+    ``["full", "sliding", "sliding", "sliding"]`` is an exact 1:3 hybrid.
+    """
+
+    if not sliding_window.get("enabled", False):
+        return None
+    pattern = list(sliding_window.get("layer_pattern", []))
+    if pattern and pattern[layer_index % len(pattern)] == "full":
+        return None
+    return int(sliding_window["window_size"])
+
+
+class HeadwiseAttentionOutputGate(nn.Module):
+    """Apply one query-dependent sigmoid scalar to each attention head.
+
+    The gate reads each head's normalized query before RoPE.  It is deliberately
+    smaller than a hidden-size projection: every head owns one vector and one
+    bias.  Disabled models do not construct this module, which keeps old state
+    dictionaries and parameter counts unchanged.
+    """
+
+    def __init__(self, num_heads: int, head_dim: int, initial_bias: float) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(num_heads, head_dim))
+        self.bias = nn.Parameter(torch.full((num_heads,), initial_bias))
+
+    def forward(self, attention_output: torch.Tensor, normalized_query: torch.Tensor) -> torch.Tensor:
+        logits = (normalized_query.float() * self.weight.float()[None, :, None, :]).sum(dim=-1)
+        logits = logits + self.bias.float()[None, :, None]
+        gate = torch.sigmoid(logits).unsqueeze(-1).to(attention_output.dtype)
+        return attention_output * gate
+
+
 def select_attention_backend(requested: str) -> tuple[str, list[str]]:
     """Choose FlashAttention -> SDPA -> eager attention and explain fallbacks."""
 
@@ -226,7 +263,7 @@ def build_attention_bias(
 class CausalSelfAttention(nn.Module):
     """MHA/MQA/GQA attention with RoPE, KV cache, and backend fallback."""
 
-    def __init__(self, cfg: DecoderConfig) -> None:
+    def __init__(self, cfg: DecoderConfig, layer_index: int) -> None:
         super().__init__()
         self.cfg = cfg
         self.num_heads = cfg.num_attention_heads
@@ -240,8 +277,13 @@ class CausalSelfAttention(nn.Module):
         self.dropout = nn.Dropout(cfg.attention_dropout)
         self.q_norm = RMSNorm(self.head_dim) if cfg.qk_norm else None
         self.k_norm = RMSNorm(self.head_dim) if cfg.qk_norm else None
+        self.output_gate = (
+            HeadwiseAttentionOutputGate(self.num_heads, self.head_dim, cfg.attention_output_gate_bias)
+            if cfg.attention_output_gate
+            else None
+        )
         self.backend, self.backend_notes = select_attention_backend(cfg.attention_backend)
-        self.window = int(cfg.sliding_window.get("window_size", 0)) if cfg.sliding_window.get("enabled") else None
+        self.window = resolve_layer_window(cfg.sliding_window, layer_index)
         # FlashAttention varlen packing path is verified numerically against the
         # SDPA reference on first use: "unverified" -> "ok" | "disabled".
         self._varlen_state = "unverified"
@@ -379,6 +421,7 @@ class CausalSelfAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
+        gate_query = q
         q, k = apply_rope(q, k, cos, sin)
         if past_key_value is not None:
             k = torch.cat([past_key_value[0], k], dim=2)
@@ -419,6 +462,8 @@ class CausalSelfAttention(nn.Module):
             probs = self.dropout(torch.softmax(scores.float(), dim=-1).to(q.dtype))
             out = torch.matmul(probs, v_full)
 
+        if self.output_gate is not None:
+            out = self.output_gate(out, gate_query)
         out = out.transpose(1, 2).contiguous().view(bsz, q_len, self.cfg.hidden_size)
         return self.o_proj(out), present
 
@@ -426,10 +471,10 @@ class CausalSelfAttention(nn.Module):
 class DecoderBlock(nn.Module):
     """Pre-norm Transformer block."""
 
-    def __init__(self, cfg: DecoderConfig) -> None:
+    def __init__(self, cfg: DecoderConfig, layer_index: int) -> None:
         super().__init__()
         self.attn_norm = RMSNorm(cfg.hidden_size)
-        self.attn = CausalSelfAttention(cfg)
+        self.attn = CausalSelfAttention(cfg, layer_index)
         self.ffn_norm = RMSNorm(cfg.hidden_size)
         self.ffn = SwiGLU(cfg.hidden_size, cfg.use_bias, cfg.residual_dropout)
         self.residual_dropout = nn.Dropout(cfg.residual_dropout)
@@ -551,7 +596,7 @@ class DecoderOnlyTransformer(nn.Module):
         self.cfg = cfg
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.embed_dropout = nn.Dropout(cfg.embedding_dropout)
-        self.layers = nn.ModuleList([DecoderBlock(cfg) for _ in range(cfg.num_layers)])
+        self.layers = nn.ModuleList([DecoderBlock(cfg, index) for index in range(cfg.num_layers)])
         self.norm = RMSNorm(cfg.hidden_size)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
         self.rotary = (
@@ -650,7 +695,6 @@ class DecoderOnlyTransformer(nn.Module):
             cos = torch.ones(shape, dtype=torch.float32, device=input_ids.device)
             sin = torch.zeros(shape, dtype=torch.float32, device=input_ids.device)
 
-        window = self.layers[0].attn.window if self.layers else None
         if attention_mode not in {"causal", "bidirectional", "prefix_block"}:
             raise ValueError(f"Unsupported attention_mode: {attention_mode}")
         if attention_mode == "prefix_block" and (
@@ -678,31 +722,30 @@ class DecoderOnlyTransformer(nn.Module):
                     raise ValueError("Every active workspace cache must match the KV cache length.")
                 if not workspace_active and state is not None:
                     raise ValueError("Inactive decoder layers cannot contain workspace cache state.")
-        needs_mask = (
-            attention_mask is not None
-            or document_ids is not None
-            or window is not None
-            or past_len > 0
-            or attention_mode != "causal"
+        common_needs_mask = (
+            attention_mask is not None or document_ids is not None or past_len > 0 or attention_mode != "causal"
         )
         eager = bool(self.layers) and self.layers[0].attn.backend == "eager"
-        simple_causal = attention_mode == "causal" and not needs_mask
-        attn_bias = None
-        if needs_mask or eager:
-            attn_bias = build_attention_bias(
-                attention_mask,
-                document_ids,
-                seq_len,
-                past_len + seq_len,
-                past_len,
-                x.dtype,
-                x.device,
-                window,
-                attention_mode,
-                prefix_lengths,
-                block_size,
-            )
-            simple_causal = False
+        layer_attention: dict[int | None, tuple[torch.Tensor | None, bool]] = {}
+        for window in {layer.attn.window for layer in self.layers}:
+            needs_mask = common_needs_mask or window is not None
+            simple_causal = attention_mode == "causal" and not needs_mask and not eager
+            attn_bias = None
+            if needs_mask or eager:
+                attn_bias = build_attention_bias(
+                    attention_mask,
+                    document_ids,
+                    seq_len,
+                    past_len + seq_len,
+                    past_len,
+                    x.dtype,
+                    x.device,
+                    window,
+                    attention_mode,
+                    prefix_lengths,
+                    block_size,
+                )
+            layer_attention[window] = (attn_bias, simple_causal)
 
         new_past: list[tuple[torch.Tensor, torch.Tensor]] = []
         new_workspace_states: list[tuple[torch.Tensor, int] | None] = []
@@ -710,15 +753,21 @@ class DecoderOnlyTransformer(nn.Module):
         hidden_states = [x] if return_hidden_states else None
         for idx, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[idx]
+            layer_attn_bias, layer_simple_causal = layer_attention[layer.attn.window]
             if self.training and self.cfg.gradient_checkpointing and not use_cache:
                 # Checkpointing trades extra compute for lower activation memory.
-                def custom_forward(hidden: torch.Tensor, current_layer=layer) -> torch.Tensor:
+                def custom_forward(
+                    hidden: torch.Tensor,
+                    current_layer=layer,
+                    current_attn_bias=layer_attn_bias,
+                    current_simple_causal=layer_simple_causal,
+                ) -> torch.Tensor:
                     return current_layer(
                         hidden,
                         cos,
                         sin,
-                        attn_bias,
-                        simple_causal,
+                        current_attn_bias,
+                        current_simple_causal,
                         document_ids,
                         None,
                         False,
@@ -732,8 +781,8 @@ class DecoderOnlyTransformer(nn.Module):
                     x,
                     cos,
                     sin,
-                    attn_bias,
-                    simple_causal,
+                    layer_attn_bias,
+                    layer_simple_causal,
                     document_ids,
                     layer_past,
                     use_cache,
@@ -873,6 +922,7 @@ class DecoderOnlyTransformer(nn.Module):
         use_cache: bool = True,
         suppress_ids: set[int] | frozenset[int] | None = None,
         trace: list[dict[str, Any]] | None = None,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Autoregressive decoding with KV cache and nucleus/top-k sampling."""
 
@@ -927,7 +977,7 @@ class DecoderOnlyTransformer(nn.Module):
                     sorted_logits = sorted_logits.masked_fill(remove, -float("inf"))
                     logits = torch.full_like(logits, -float("inf")).scatter(1, sorted_idx, sorted_logits)
                 probs = torch.softmax(logits, dim=-1)
-                next_id = torch.multinomial(probs, num_samples=1)
+                next_id = torch.multinomial(probs, num_samples=1, generator=generator)
                 sampling_probabilities = probs
             if trace is not None:
                 entropy = -(sampling_probabilities * sampling_probabilities.clamp_min(1e-12).log()).sum(dim=-1)

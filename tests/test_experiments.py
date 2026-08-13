@@ -68,6 +68,23 @@ def test_activation_monitor_records_and_intervenes(tmp_path) -> None:
     assert row["delta_rms"] > 0
 
 
+def test_activation_experiment_reports_only_current_stochastic_interventions(tmp_path) -> None:
+    config = tiny_config()
+    config["experiments"].update(enabled=True)
+    config["experiments"]["activation_monitor"]["enabled"] = False
+    config["experiments"]["interventions"] = [
+        {"module": "layers.0", "kind": "noise", "value": 0.1, "start_step": 2, "end_step": 3}
+    ]
+    experiment = ActivationExperiment(build_model(config), config, tmp_path)
+
+    assert experiment.has_active_stochastic_interventions() is False
+    experiment.set_step(2)
+    assert experiment.has_active_stochastic_interventions() is True
+    experiment.set_step(4)
+    assert experiment.has_active_stochastic_interventions() is False
+    experiment.close()
+
+
 def test_runtime_patch_is_shape_safe_and_does_not_rewrite_source_config() -> None:
     config = tiny_config()
     config["experiments"]["runtime_patches"] = [
@@ -128,3 +145,35 @@ def test_hybrid_generation_resolves_every_mask_and_emits_trace() -> None:
     assert not output.eq(63).any()
     assert trace
     assert {row["phase"] for row in trace}.issubset({"ar", "diffusion"})
+
+
+def test_hybrid_generation_uses_local_rng_without_mutating_global_state() -> None:
+    torch.manual_seed(103)
+    model = build_model(tiny_config()).eval()
+    prompt = torch.tensor([[1, 10, 11]])
+    global_before = torch.random.get_rng_state().clone()
+
+    def generate(seed: int) -> torch.Tensor:
+        return hybrid_generate(
+            model,
+            prompt,
+            max_new_tokens=7,
+            eos_id=-1,
+            mask_id=63,
+            block_size=3,
+            denoise_steps=2,
+            ar_warmup_tokens=1,
+            temperature=1.0,
+            top_p=1.0,
+            top_k=0,
+            repetition_penalty=1.0,
+            suppress_ids={63},
+            generator=torch.Generator().manual_seed(seed),
+        )
+
+    first = generate(19)
+    global_after = torch.random.get_rng_state()
+    second = generate(19)
+
+    assert torch.equal(global_before, global_after)
+    assert torch.equal(first, second)

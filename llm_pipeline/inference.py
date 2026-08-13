@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+from collections import Counter
 from collections.abc import Iterator
 from copy import deepcopy
 from dataclasses import dataclass
@@ -13,6 +15,7 @@ from typing import Any
 import torch
 
 from .artifacts import (
+    REASONING_GENERATION_PROTOCOL_VERSION,
     atomic_write_json,
     atomic_write_jsonl,
     build_rejects_fingerprint,
@@ -38,6 +41,11 @@ class GenerationResult:
     reasoning_mode: str
     reasoning_tokens: int = 0
     reasoning_trace: str | None = None
+    candidate_count: int = 1
+    reasoning_compute_tokens: int = 0
+    answer_compute_tokens: int = 0
+    selector_used: bool = False
+    selector_compute_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -48,6 +56,17 @@ class _DecodedPhase:
     input_ids: torch.Tensor
     token_ids: tuple[int, ...]
     trace: list[dict[str, Any]] | None
+
+
+@dataclass(frozen=True)
+class _ReasoningCandidate:
+    """One ephemeral reasoning path and its final answer."""
+
+    answer: str
+    scratchpad: str
+    scratchpad_ids: tuple[int, ...]
+    final_phase: _DecodedPhase
+    reasoning_generated_tokens: int
 
 
 def apply_reasoning_control(prompt: str, config: dict[str, Any], mode: str | None = None) -> str:
@@ -245,6 +264,7 @@ class TextGenerator:
         allow_token_trace: bool,
         reserve_new_tokens: int = 0,
         allow_reasoning_boundary: bool = False,
+        generator: torch.Generator | None = None,
     ) -> _DecodedPhase:
         """Decode one phase while keeping scratchpad and final traces separate."""
 
@@ -260,6 +280,7 @@ class TextGenerator:
             phase=phase,
             allow_token_trace=allow_token_trace,
             allow_reasoning_boundary=allow_reasoning_boundary,
+            generator=generator,
         )
 
     def _decode_from_ids(
@@ -271,6 +292,7 @@ class TextGenerator:
         phase: str,
         allow_token_trace: bool,
         allow_reasoning_boundary: bool = False,
+        generator: torch.Generator | None = None,
     ) -> _DecodedPhase:
         """Decode from an existing token prefix without re-tokenizing it."""
 
@@ -301,6 +323,7 @@ class TextGenerator:
                 repetition_penalty=float(settings["repetition_penalty"]),
                 suppress_ids=suppress_ids,
                 trace=trace,
+                generator=generator,
             )
         else:
             self.activation_experiment.set_phase(f"ar_{phase}")
@@ -315,6 +338,7 @@ class TextGenerator:
                 use_cache=bool(settings["use_kv_cache"]),
                 suppress_ids=suppress_ids,
                 trace=trace,
+                generator=generator,
             )
         generated_ids = output[0].tolist()[input_ids.size(1) :]
         if trace is not None:
@@ -328,6 +352,177 @@ class TextGenerator:
             token_ids=tuple(generated_ids),
             trace=trace,
         )
+
+    def _candidate_generator(self, prompt_text: str, candidate_index: int) -> torch.Generator:
+        """Create a stable per-candidate RNG without changing global RNG state."""
+
+        configured_system = "\n\n".join(
+            part
+            for part in (
+                self.config["inference"].get("model_system_prompt", ""),
+                *(read_prompt_file(path) for path in self.config["inference"].get("model_system_prompt_files", [])),
+            )
+            if part
+        )
+        payload = "\0".join(
+            (
+                str(REASONING_GENERATION_PROTOCOL_VERSION),
+                str(int(self.config["run"]["seed"])),
+                configured_system,
+                prompt_text,
+                str(candidate_index),
+            )
+        ).encode("utf-8")
+        seed = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & ((1 << 63) - 1)
+        return torch.Generator(device=self.device).manual_seed(seed)
+
+    def _run_reasoning_candidate(
+        self,
+        prompt_text: str,
+        effective_user_system: str,
+        mode: str,
+        settings: dict[str, Any],
+        *,
+        generator: torch.Generator | None = None,
+    ) -> _ReasoningCandidate:
+        """Generate one scratchpad and final answer without external side effects."""
+
+        scratchpad_instruction = (
+            read_prompt_file(self.config["reasoning"].get("scratchpad_instruction_file"))
+            or self.config["reasoning"]["scratchpad_instruction"]
+        )
+        scratchpad_system = "\n\n".join(part for part in (effective_user_system, scratchpad_instruction) if part)
+        reasoning_prompt = build_inference_prompt(
+            self.config,
+            prompt_text,
+            user_system_prompt=scratchpad_system or None,
+            reasoning_mode=mode,
+        )
+        reasoning_settings = {
+            **settings,
+            "max_new_tokens": reasoning_token_budget(self.config, mode),
+            "token_trace_file": None,
+        }
+        boundary_token = self.config["tokenizer"]["special_tokens"]["reasoning_off"]
+        boundary_id = self.tokenizer.piece_to_id(boundary_token)
+        forced_boundary_ids = self.tokenizer.encode(
+            f"\n{boundary_token}\n",
+            add_special_tokens=False,
+        )
+        if forced_boundary_ids.count(boundary_id) != 1:
+            raise RuntimeError("Tokenizer did not encode exactly one reasoning-off boundary.")
+        requested_final_tokens = max(0, int(settings["max_new_tokens"]))
+        reasoning_phase = self._decode(
+            reasoning_prompt,
+            reasoning_settings,
+            phase="reasoning",
+            allow_token_trace=False,
+            reserve_new_tokens=len(forced_boundary_ids) + requested_final_tokens,
+            allow_reasoning_boundary=True,
+            generator=generator,
+        )
+        generated_reasoning_ids = list(reasoning_phase.token_ids)
+        if boundary_id in generated_reasoning_ids:
+            boundary_index = generated_reasoning_ids.index(boundary_id)
+            scratchpad_ids = generated_reasoning_ids[:boundary_index]
+            continuation_ids = generated_reasoning_ids[: boundary_index + 1]
+        else:
+            scratchpad_ids = generated_reasoning_ids
+            continuation_ids = []
+        while scratchpad_ids and scratchpad_ids[-1] == self.tokenizer.eos_id:
+            scratchpad_ids.pop()
+        if not continuation_ids:
+            continuation_ids = [*scratchpad_ids, *forced_boundary_ids]
+        final_input_ids = torch.cat(
+            (
+                reasoning_phase.input_ids,
+                torch.tensor([continuation_ids], dtype=torch.long, device=self.device),
+            ),
+            dim=1,
+        )
+        final_phase = self._decode_from_ids(
+            final_input_ids,
+            requested_final_tokens,
+            settings,
+            phase="inference",
+            allow_token_trace=bool(settings.get("token_trace_file") or self.memory is not None),
+            generator=generator,
+        )
+        return _ReasoningCandidate(
+            answer=final_phase.text.strip(),
+            scratchpad=self.tokenizer.decode(scratchpad_ids).strip(),
+            scratchpad_ids=tuple(scratchpad_ids),
+            final_phase=final_phase,
+            reasoning_generated_tokens=len(reasoning_phase.token_ids),
+        )
+
+    def _normalized_candidate_answer(self, answer: str) -> str:
+        return clean_text(answer, self.config["data"]["normalize_nfkc"]).casefold()
+
+    def _selector_answer(self, answer: str, max_tokens: int) -> str:
+        ids = self.tokenizer.encode(answer, add_special_tokens=False)[:max_tokens]
+        return self.tokenizer.decode(ids).strip() or "[empty answer]"
+
+    def _select_reasoning_candidate(
+        self,
+        prompt_text: str,
+        effective_user_system: str,
+        candidates: list[_ReasoningCandidate],
+        settings: dict[str, Any],
+        tta: dict[str, Any],
+    ) -> tuple[int, bool, int]:
+        """Choose by strict majority, then by a private deterministic selector."""
+
+        normalized = [self._normalized_candidate_answer(candidate.answer) for candidate in candidates]
+        counts = Counter(normalized)
+        majority_answer, majority_count = counts.most_common(1)[0]
+        if majority_answer and majority_count > len(candidates) // 2:
+            return normalized.index(majority_answer), False, 0
+
+        if len(candidates) > 26:
+            self._warn_limited("Reasoning selector supports at most 26 candidates; using the earliest candidate.")
+            return 0, False, 0
+        labels = [chr(ord("A") + index) for index in range(len(candidates))]
+        candidate_token_limit = int(tta["selector_candidate_max_tokens"])
+        rendered_candidates = "\n\n".join(
+            f"{label}. {self._selector_answer(candidate.answer, candidate_token_limit)}"
+            for label, candidate in zip(labels, candidates, strict=True)
+        )
+        selector_prompt = f"Original request:\n{prompt_text}\n\nCandidate final answers:\n{rendered_candidates}"
+        selector_instruction = (
+            "Privately select the candidate that best answers the original request. "
+            f"Return exactly one ASCII letter from {', '.join(labels)} and no other text."
+        )
+        rendered_selector = build_inference_prompt(
+            self.config,
+            selector_prompt,
+            user_system_prompt="\n\n".join(part for part in (effective_user_system, selector_instruction) if part),
+            reasoning_mode="off",
+        )
+        selector_settings = {
+            **settings,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 0,
+            "repetition_penalty": 1.0,
+            "max_new_tokens": int(tta["selector_max_new_tokens"]),
+            "token_trace_file": None,
+            "strict_context_fit": True,
+        }
+        try:
+            selector_phase = self._decode(
+                rendered_selector,
+                selector_settings,
+                phase="reasoning_selector",
+                allow_token_trace=False,
+            )
+            selector = selector_phase.text.strip()
+        except RuntimeError as exc:
+            if "context" not in str(exc).lower() and "fit" not in str(exc).lower():
+                raise
+            self._warn_limited("Reasoning selector did not fit the context; using the earliest candidate.")
+            return 0, True, 0
+        return (labels.index(selector) if selector in labels else 0), True, len(selector_phase.token_ids)
 
     @torch.no_grad()
     def generate_result(
@@ -357,67 +552,84 @@ class TextGenerator:
             raise ValueError(f"Unsupported reasoning mode '{mode}'. Expected {self.config['reasoning']['modes']}")
 
         scratchpad = ""
-        scratchpad_ids: list[int] = []
+        scratchpad_ids: tuple[int, ...] = ()
+        candidate_count = 1
+        reasoning_compute_tokens = 0
+        answer_compute_tokens = 0
+        selector_compute_tokens = 0
+        selector_used = False
         budget = reasoning_token_budget(self.config, mode)
         if mode != "off" and budget <= 0:
             mode = "off"
         final_phase: _DecodedPhase
         if budget > 0:
-            scratchpad_instruction = (
-                read_prompt_file(self.config["reasoning"].get("scratchpad_instruction_file"))
-                or self.config["reasoning"]["scratchpad_instruction"]
-            )
-            scratchpad_system = "\n\n".join(part for part in (effective_user_system, scratchpad_instruction) if part)
-            reasoning_prompt = build_inference_prompt(
-                self.config,
-                prompt_text,
-                user_system_prompt=scratchpad_system or None,
-                reasoning_mode=mode,
-            )
-            reasoning_settings = {**settings, "max_new_tokens": budget, "token_trace_file": None}
-            boundary_token = self.config["tokenizer"]["special_tokens"]["reasoning_off"]
-            boundary_id = self.tokenizer.piece_to_id(boundary_token)
-            forced_boundary_ids = self.tokenizer.encode(
-                f"\n{boundary_token}\n",
-                add_special_tokens=False,
-            )
-            if forced_boundary_ids.count(boundary_id) != 1:
-                raise RuntimeError("Tokenizer did not encode exactly one reasoning-off boundary.")
-            requested_final_tokens = max(0, int(settings["max_new_tokens"]))
-            reasoning_phase = self._decode(
-                reasoning_prompt,
-                reasoning_settings,
-                phase="reasoning",
-                allow_token_trace=False,
-                reserve_new_tokens=len(forced_boundary_ids) + requested_final_tokens,
-                allow_reasoning_boundary=True,
-            )
-            generated_reasoning_ids = list(reasoning_phase.token_ids)
-            if boundary_id in generated_reasoning_ids:
-                boundary_index = generated_reasoning_ids.index(boundary_id)
-                scratchpad_ids = generated_reasoning_ids[:boundary_index]
-                continuation_ids = generated_reasoning_ids[: boundary_index + 1]
+            tta = self.config["reasoning"].get("test_time_compute") or {}
+            if tta.get("enabled", False) and mode == tta.get("mode", "max"):
+                if self.activation_experiment.has_active_stochastic_interventions():
+                    raise RuntimeError(
+                        "Seeded maximum-effort reasoning cannot run with an active noise activation intervention. "
+                        "Disable the noise intervention or use a single-candidate reasoning mode."
+                    )
+                candidate_settings = {
+                    **settings,
+                    "temperature": float(tta["candidate_temperature"]),
+                    "top_p": float(tta["candidate_top_p"]),
+                    "top_k": int(tta["candidate_top_k"]),
+                }
+                activation_records = getattr(self.activation_experiment, "records", None)
+                baseline_records = list(activation_records) if isinstance(activation_records, list) else None
+                candidate_records: list[list[dict[str, Any]]] = []
+                candidates = []
+                try:
+                    for candidate_index in range(int(tta["candidates"])):
+                        if baseline_records is not None:
+                            activation_records[:] = baseline_records
+                        candidates.append(
+                            self._run_reasoning_candidate(
+                                prompt_text,
+                                effective_user_system,
+                                mode,
+                                candidate_settings,
+                                generator=self._candidate_generator(prompt_text, candidate_index),
+                            )
+                        )
+                        if baseline_records is not None:
+                            candidate_records.append(list(activation_records[len(baseline_records) :]))
+                    if baseline_records is not None:
+                        activation_records[:] = baseline_records
+                    selected_index, selector_used, selector_compute_tokens = self._select_reasoning_candidate(
+                        prompt_text,
+                        effective_user_system,
+                        candidates,
+                        settings,
+                        tta,
+                    )
+                finally:
+                    if baseline_records is not None:
+                        activation_records[:] = baseline_records
+                if baseline_records is not None:
+                    capacity = max(
+                        0,
+                        int(getattr(self.activation_experiment, "max_records", len(activation_records)))
+                        - len(activation_records),
+                    )
+                    activation_records.extend(candidate_records[selected_index][:capacity])
+                selected = candidates[selected_index]
+                candidate_count = len(candidates)
+                reasoning_compute_tokens = sum(candidate.reasoning_generated_tokens for candidate in candidates)
+                answer_compute_tokens = sum(len(candidate.final_phase.token_ids) for candidate in candidates)
             else:
-                scratchpad_ids = generated_reasoning_ids
-                continuation_ids = []
-            while scratchpad_ids and scratchpad_ids[-1] == self.tokenizer.eos_id:
-                scratchpad_ids.pop()
-            if not continuation_ids:
-                continuation_ids = [*scratchpad_ids, *forced_boundary_ids]
-            scratchpad = self.tokenizer.decode(scratchpad_ids).strip()
-            continuation_ids = torch.tensor(
-                [continuation_ids],
-                dtype=torch.long,
-                device=self.device,
-            )
-            final_input_ids = torch.cat((reasoning_phase.input_ids, continuation_ids), dim=1)
-            final_phase = self._decode_from_ids(
-                final_input_ids,
-                requested_final_tokens,
-                settings,
-                phase="inference",
-                allow_token_trace=bool(settings.get("token_trace_file") or self.memory is not None),
-            )
+                selected = self._run_reasoning_candidate(
+                    prompt_text,
+                    effective_user_system,
+                    mode,
+                    settings,
+                )
+                reasoning_compute_tokens = selected.reasoning_generated_tokens
+                answer_compute_tokens = len(selected.final_phase.token_ids)
+            scratchpad = selected.scratchpad
+            scratchpad_ids = selected.scratchpad_ids
+            final_phase = selected.final_phase
         else:
             final_prompt = build_inference_prompt(
                 self.config,
@@ -431,6 +643,7 @@ class TextGenerator:
                 phase="inference",
                 allow_token_trace=bool(settings.get("token_trace_file") or self.memory is not None),
             )
+            answer_compute_tokens = len(final_phase.token_ids)
         if settings.get("token_trace_file") and final_phase.trace is not None:
             atomic_write_jsonl(settings["token_trace_file"], final_phase.trace)
 
@@ -466,6 +679,11 @@ class TextGenerator:
             reasoning_mode=mode,
             reasoning_tokens=len(scratchpad_ids),
             reasoning_trace=exposed,
+            candidate_count=candidate_count,
+            reasoning_compute_tokens=reasoning_compute_tokens,
+            answer_compute_tokens=answer_compute_tokens,
+            selector_compute_tokens=selector_compute_tokens,
+            selector_used=selector_used,
         )
 
     @torch.no_grad()
@@ -526,6 +744,11 @@ def run_inference(config: dict[str, Any], logger: Any) -> None:
             "output_chars": len(output),
             "reasoning_mode": result.reasoning_mode,
             "reasoning_tokens": result.reasoning_tokens,
+            "candidate_count": result.candidate_count,
+            "reasoning_compute_tokens": result.reasoning_compute_tokens,
+            "answer_compute_tokens": result.answer_compute_tokens,
+            "selector_compute_tokens": result.selector_compute_tokens,
+            "selector_used": result.selector_used,
             "checkpoint": str(generator.checkpoint),
             "inference_fingerprint": inference_fingerprint(config, generator.checkpoint),
             "settings": config["inference"],

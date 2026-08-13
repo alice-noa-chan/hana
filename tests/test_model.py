@@ -52,11 +52,145 @@ def test_forward_loss_is_finite_and_zero_label_batches_fail() -> None:
         model(input_ids, labels=torch.full_like(input_ids, -100))
 
 
+def test_generate_uses_local_rng_without_mutating_global_state() -> None:
+    torch.manual_seed(101)
+    model = build_model(tiny_config()).eval()
+    prompt = torch.tensor([[1, 7, 8]])
+    global_before = torch.random.get_rng_state().clone()
+
+    first = model.generate(
+        prompt,
+        max_new_tokens=6,
+        eos_id=-1,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=0,
+        generator=torch.Generator().manual_seed(17),
+    )
+    global_after = torch.random.get_rng_state()
+    second = model.generate(
+        prompt,
+        max_new_tokens=6,
+        eos_id=-1,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=0,
+        generator=torch.Generator().manual_seed(17),
+    )
+
+    assert torch.equal(global_before, global_after)
+    assert torch.equal(first, second)
+
+
 def test_disabled_mtp_does_not_allocate_unused_projection_heads() -> None:
     config = tiny_config()
     assert len(build_model(config).mtp_heads) == 0
     config["mtp"]["enabled"] = True
     assert len(build_model(config).mtp_heads) == config["mtp"]["num_future_tokens"]
+
+
+def test_public_qk_norm_count_and_opt_in_gate_parameter_delta() -> None:
+    production = copy.deepcopy(DEFAULT_CONFIG)
+    production["model"].update(
+        vocab_size=32000,
+        hidden_size=1024,
+        num_layers=24,
+        num_attention_heads=16,
+        num_key_value_heads=4,
+        max_position_embeddings=2048,
+        max_seq_len=2048,
+        qk_norm=True,
+        attention_output_gate=False,
+    )
+    with torch.device("meta"):
+        baseline = build_model(production)
+        baseline_count = sum(parameter.numel() for parameter in baseline.parameters())
+    assert baseline_count == 303_353_856
+
+    gated = tiny_config()
+    gated["model"]["attention_output_gate"] = True
+    baseline_tiny = tiny_config()
+    baseline_tiny["model"]["attention_output_gate"] = False
+    gated_count = sum(parameter.numel() for parameter in build_model(gated).parameters())
+    baseline_tiny_count = sum(parameter.numel() for parameter in build_model(baseline_tiny).parameters())
+    head_dim = gated["model"]["hidden_size"] // gated["model"]["num_attention_heads"]
+    expected_delta = gated["model"]["num_layers"] * gated["model"]["num_attention_heads"] * (head_dim + 1)
+    assert gated_count - baseline_tiny_count == expected_delta
+    first_gate = build_model(gated).layers[0].attn.output_gate
+    assert first_gate is not None
+    assert torch.count_nonzero(first_gate.weight).item() == 0
+    torch.testing.assert_close(first_gate.bias, torch.full_like(first_gate.bias, 2.0))
+
+
+def test_disabled_gate_and_pattern_preserve_legacy_state_and_logits() -> None:
+    explicit = tiny_config()
+    explicit["model"].update(qk_norm=False, attention_output_gate=False)
+    explicit["model"]["sliding_window"].update(enabled=False, layer_pattern=[])
+    legacy = copy.deepcopy(explicit)
+    legacy["model"].pop("attention_output_gate")
+    legacy["model"]["sliding_window"].pop("layer_pattern")
+
+    torch.manual_seed(8)
+    explicit_model = build_model(explicit).eval()
+    torch.manual_seed(8)
+    legacy_model = build_model(legacy).eval()
+    assert explicit_model.state_dict().keys() == legacy_model.state_dict().keys()
+    assert not any("output_gate" in key for key in explicit_model.state_dict())
+
+    input_ids = torch.randint(4, 64, (1, 8))
+    torch.testing.assert_close(explicit_model(input_ids)["logits"], legacy_model(input_ids)["logits"])
+
+
+def test_attention_output_gate_keeps_kv_cache_exact() -> None:
+    torch.manual_seed(9)
+    config = tiny_config()
+    config["model"]["attention_output_gate"] = True
+    model = build_model(config).eval()
+    input_ids = torch.randint(4, 64, (1, 9))
+
+    full = model(input_ids)["logits"]
+    prefix = model(input_ids[:, :5], use_cache=True)
+    suffix = model(input_ids[:, 5:], past_key_values=prefix["past_key_values"], use_cache=True)["logits"]
+
+    torch.testing.assert_close(suffix, full[:, 5:], atol=1e-5, rtol=1e-5)
+
+
+def hybrid_tiny_config() -> dict:
+    config = tiny_config()
+    config["model"]["num_layers"] = 5
+    config["model"]["sliding_window"].update(
+        enabled=True,
+        window_size=4,
+        layer_pattern=["full", "sliding", "sliding", "sliding"],
+    )
+    return config
+
+
+def test_hybrid_attention_repeats_exact_full_sliding_schedule() -> None:
+    model = build_model(hybrid_tiny_config())
+    assert [layer.attn.window for layer in model.layers] == [None, 4, 4, 4, None]
+
+
+def test_hybrid_attention_cache_matches_full_forward() -> None:
+    torch.manual_seed(10)
+    model = build_model(hybrid_tiny_config()).eval()
+    input_ids = torch.randint(4, 64, (1, 10))
+    full = model(input_ids)["logits"]
+    prefix = model(input_ids[:, :6], use_cache=True)
+    suffix = model(input_ids[:, 6:], past_key_values=prefix["past_key_values"], use_cache=True)["logits"]
+    torch.testing.assert_close(suffix, full[:, 6:], atol=1e-5, rtol=1e-5)
+
+
+def test_hybrid_attention_keeps_packed_documents_isolated() -> None:
+    torch.manual_seed(11)
+    model = build_model(hybrid_tiny_config()).eval()
+    first = torch.tensor([[7, 8, 9, 20, 21, 22]])
+    second = torch.tensor([[40, 41, 42, 20, 21, 22]])
+    position_ids = torch.tensor([[0, 1, 2, 0, 1, 2]])
+    document_ids = torch.tensor([[0, 0, 0, 1, 1, 1]])
+    first_logits = model(first, position_ids=position_ids, document_ids=document_ids)["logits"]
+    second_logits = model(second, position_ids=position_ids, document_ids=document_ids)["logits"]
+    torch.testing.assert_close(first_logits[:, 3:], second_logits[:, 3:], atol=1e-5, rtol=1e-5)
 
 
 def test_kv_cache_matches_full_causal_forward() -> None:
