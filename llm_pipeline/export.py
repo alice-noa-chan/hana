@@ -43,7 +43,7 @@ def run_export(config: dict[str, Any], logger: Any) -> Path:
             staged / "export_manifest.json",
             {
                 "format_version": 1,
-                "source_checkpoint": str(source),
+                "source_checkpoint": source.name,
                 "source_stage": checkpoint_stage(source),
                 "dataset_type": dataset_type,
                 "export_fingerprint": export_fingerprint(config, source),

@@ -7,6 +7,7 @@ import yaml
 
 from llm_pipeline.config import load_config, redacted_config_for_artifact
 from llm_pipeline.main import main
+from llm_pipeline.tokenizer import load_tokenizer
 from scripts.prepare_synthetic_smoke import write_smoke_fixture
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +55,14 @@ def test_complete_cpu_pipeline(tmp_path: Path) -> None:
     assert (logs / "eval_summary.md").is_file()
     assert (logs / "inference.json").is_file()
     assert (exported / "export_manifest.json").is_file()
+    export_manifest = json.loads((exported / "export_manifest.json").read_text(encoding="utf-8"))
+    assert export_manifest["source_checkpoint"] == "best"
+    assert str(tmp_path) not in json.dumps(export_manifest)
+    tokenizer = load_tokenizer(config)
+    boundary_token = config["tokenizer"]["special_tokens"]["reasoning_off"]
+    boundary_ids = tokenizer.encode(f"\n{boundary_token}\n", add_special_tokens=False)
+    assert boundary_ids.count(tokenizer.piece_to_id(boundary_token)) == 1
+    assert len(boundary_ids) > 1
     assert (tmp_path / "experiments/pretrain/activations.jsonl").stat().st_size > 0
     assert (tmp_path / "experiments/pretrain/gradients.jsonl").stat().st_size > 0
     assert (tmp_path / "experiments/inference/activations.jsonl").stat().st_size > 0

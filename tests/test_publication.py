@@ -65,6 +65,36 @@ def test_publication_check_rejects_embedded_private_evidence(tmp_path: Path) -> 
     assert any("literal SHA-256" in violation for violation in violations)
 
 
+def test_publication_check_rejects_private_pilot_configuration(tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text(
+        "data:\n  sources: []\n  pack:\n    languages: []\n"
+        "inference: {}\ndpo: {}\n"
+        "eval:\n  knowledge_pilot:\n    enabled: true\n    file: private-pilot.jsonl\n",
+        encoding="utf-8",
+    )
+
+    violations = find_publication_violations(tmp_path, [])
+
+    assert any("private knowledge pilot" in violation for violation in violations)
+
+
+def test_publication_check_rejects_private_pilot_in_alternate_public_config(tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text(
+        "data:\n  sources: []\ninference: {}\ndpo: {}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "alternate.yaml").write_text(
+        "data:\n  sources: []\ninference: {}\ndpo: {}\n"
+        "eval:\n  knowledge_pilot:\n    enabled: true\n    file: private-pilot.jsonl\n",
+        encoding="utf-8",
+    )
+
+    violations = find_publication_violations(tmp_path, [])
+
+    assert any("configs/alternate.yaml" in violation for violation in violations)
+
+
 def test_publication_check_rejects_dataset_deleted_from_current_tree(tmp_path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "user.name", "Synthetic Test"], cwd=tmp_path, check=True)
@@ -81,6 +111,20 @@ def test_publication_check_rejects_dataset_deleted_from_current_tree(tmp_path: P
     violations = find_history_violations(tmp_path)
 
     assert any("private_data/sample.jsonl" in violation for violation in violations)
+
+
+def test_publication_check_scans_nonignored_untracked_files(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "config.yaml").write_text(
+        "data:\n  sources: []\n  pack:\n    languages: []\ninference: {}\ndpo: {}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "private_data").mkdir()
+    (tmp_path / "private_data" / "untracked.jsonl").write_text('{"text":"synthetic"}\n', encoding="utf-8")
+
+    violations = find_publication_violations(tmp_path)
+
+    assert any("private_data/untracked.jsonl" in violation for violation in violations)
 
 
 def test_synthetic_smoke_writer_is_safe_for_concurrent_test_sessions(tmp_path: Path) -> None:

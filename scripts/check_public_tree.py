@@ -128,9 +128,12 @@ PUBLIC_TEXT_SUFFIXES = {".md", ".py", ".toml", ".txt", ".yaml", ".yml"}
 
 
 def tracked_paths(root: Path = PROJECT_ROOT) -> list[str]:
-    """Return NUL-safe tracked paths from Git."""
+    """Return tracked plus non-ignored untracked paths from Git."""
 
-    output = subprocess.check_output(["git", "ls-files", "-z"], cwd=root)
+    output = subprocess.check_output(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=root,
+    )
     return [value.decode("utf-8") for value in output.split(b"\0") if value]
 
 
@@ -222,25 +225,38 @@ def _content_violations(root: Path, paths: Iterable[str]) -> list[str]:
 
 
 def _config_violations(root: Path) -> list[str]:
-    path = root / "config.yaml"
-    if not path.is_file():
+    paths = [root / "config.yaml"]
+    configs_dir = root / "configs"
+    if configs_dir.is_dir():
+        paths.extend(path for path in configs_dir.glob("*.yaml") if path.name != "sources.example.yaml")
+    if not paths[0].is_file():
         return ["public config.yaml is missing"]
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        return ["public config.yaml must contain a mapping"]
     violations = []
-    data = payload.get("data", {})
-    if data.get("sources"):
-        violations.append("public config.yaml must not contain data.sources entries")
-    if data.get("pack", {}).get("languages"):
-        violations.append("public config.yaml must not disclose private pack languages")
-    inference = payload.get("inference", {})
-    if inference.get("model_system_prompt") or inference.get("model_system_prompt_files"):
-        violations.append("public config.yaml must not contain private model prompts")
-    if inference.get("user_system_prompt") or inference.get("user_system_prompt_file"):
-        violations.append("public config.yaml must not contain private user prompts")
-    if payload.get("dpo", {}).get("prompt_sources"):
-        violations.append("public config.yaml must not name private DPO sources")
+    for path in paths:
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix()
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            violations.append(f"public configuration must contain a mapping: {relative}")
+            continue
+        data = payload.get("data", {})
+        if data.get("sources"):
+            violations.append(f"public configuration must not contain data.sources entries: {relative}")
+        inference = payload.get("inference", {})
+        if inference.get("model_system_prompt") or inference.get("model_system_prompt_files"):
+            violations.append(f"public configuration must not contain private model prompts: {relative}")
+        if inference.get("user_system_prompt") or inference.get("user_system_prompt_file"):
+            violations.append(f"public configuration must not contain private user prompts: {relative}")
+        if payload.get("dpo", {}).get("prompt_sources"):
+            violations.append(f"public configuration must not name private DPO sources: {relative}")
+        if payload.get("reasoning", {}).get("scratchpad_instruction_file"):
+            violations.append(f"public configuration must not contain a private reasoning prompt path: {relative}")
+        knowledge_pilot = payload.get("eval", {}).get("knowledge_pilot", {})
+        if knowledge_pilot.get("enabled") or knowledge_pilot.get("file") or knowledge_pilot.get("prompt_file"):
+            violations.append(
+                f"public configuration must keep the private knowledge pilot disabled and data-free: {relative}"
+            )
     return violations
 
 
