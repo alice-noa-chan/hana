@@ -1,0 +1,63 @@
+schema_version: 1
+
+# This file is a plan, not a result report. It does not start training and it
+# does not claim that the tested idea is new.
+studies:
+  - id: "workspace_v1"
+    kind: "architecture_ablation"
+    hypothesis: >-
+      A small causal workspace may improve validation loss at the same training
+      token budget without reducing token accuracy or global training speed
+      beyond the declared guardrails.
+    claim_status: "unverified_hypothesis"
+    baseline_arm: "dense_control"
+
+    # Every baseline and candidate arm must use every seed and the same budget.
+    controls:
+      seeds: [42, 43, 44]
+      budget:
+        basis: "train_tokens"
+        value: 100000000
+
+    metrics:
+      # Smaller validation loss is better. A candidate needs an absolute mean
+      # improvement of at least 0.02 before it can be promoted.
+      primary:
+        name: "valid_loss"
+        direction: "min"
+        minimum_improvement: 0.02
+        maximum_regression: 0.01
+
+      # Each name below must exist once for every required arm and seed.
+      required:
+        - "valid_loss"
+        - "token_accuracy"
+        - "train_tokens_per_sec_global"
+        - "cuda_peak_reserved_gib"
+
+      # A candidate is rejected when a guardrail becomes worse by more than its
+      # allowed absolute amount. Metric thresholds use the metric's own units.
+      guardrails:
+        token_accuracy:
+          direction: "max"
+          maximum_regression: 0.01
+        train_tokens_per_sec_global:
+          direction: "max"
+          maximum_regression: 100.0
+        cuda_peak_reserved_gib:
+          direction: "min"
+          maximum_regression: 0.25
+
+    arms:
+      # The referenced baseline always has an empty changed_keys list.
+      - id: "dense_control"
+        config: "workspace_control.yaml"
+        changed_keys: []
+
+      # The candidate declares every intentional config change relative to the
+      # baseline. A later caller must load both configs and verify this list.
+      - id: "workspace_on"
+        config: "workspace_on.yaml"
+        changed_keys:
+          - "cognitive_architecture.enabled"
+          - "cognitive_architecture.workspace.enabled"
