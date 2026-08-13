@@ -28,9 +28,41 @@ from .data import (
 )
 from .model_config import with_tokenizer_vocab
 from .model_io import load_model_from_checkpoint
+from .multiple_choice import preflight_knowledge_pilot, run_knowledge_pilot
 from .tokenizer import load_tokenizer
 from .training import evaluate_loss, sequence_logprob
 from .training_runtime import choose_device, configure_torch_performance
+
+_SAFE_CACHED_EVALUATION_FIELDS = frozenset(
+    {
+        "checkpoint",
+        "valid_loss",
+        "valid_objective",
+        "perplexity",
+        "token_accuracy",
+        "dpo_sample_count",
+        "chosen_rejected_accuracy",
+        "reward_margin",
+        "multiturn_memory_n_turn_accuracy",
+        "memory_probe_count",
+        "correct_count",
+        "item_count",
+        "accuracy",
+        "parse_rate",
+        "passed",
+        "evaluation_fingerprint",
+    }
+)
+
+
+def _safe_cached_evaluation_row(row: Any) -> dict[str, Any] | None:
+    """Accept only aggregate fields that this evaluator writes itself."""
+
+    if not isinstance(row, dict) or not set(row).issubset(_SAFE_CACHED_EVALUATION_FIELDS):
+        return None
+    if not isinstance(row.get("checkpoint"), str) or not isinstance(row.get("evaluation_fingerprint"), str):
+        return None
+    return row
 
 
 def resolve_checkpoint(config: dict[str, Any], name: str) -> Path:
@@ -217,6 +249,7 @@ def run_memory_eval(config: dict[str, Any], logger: Any, checkpoint: Path) -> di
 def run_eval(config: dict[str, Any], logger: Any) -> None:
     """Evaluate configured latest/best checkpoints and write JSONL + markdown summary."""
 
+    preflight_knowledge_pilot(config)
     output_dir = logger.log_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_dir / "eval_results.jsonl"
@@ -235,9 +268,9 @@ def run_eval(config: dict[str, Any], logger: Any) -> None:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                checkpoint_name = str(row.get("checkpoint", ""))
-                if checkpoint_name and isinstance(row.get("evaluation_fingerprint"), str):
-                    cache[checkpoint_name] = row
+                safe_row = _safe_cached_evaluation_row(row)
+                if safe_row is not None:
+                    cache[safe_row["checkpoint"]] = safe_row
 
     checkpoint_names = config["eval"].get("checkpoints", ["latest", "best"])
     results: list[dict[str, Any]] = []
@@ -259,10 +292,13 @@ def run_eval(config: dict[str, Any], logger: Any) -> None:
         metrics = evaluate_checkpoint(config, logger, checkpoint)
         dpo_metrics = evaluate_dpo(config, logger, checkpoint)
         memory_metrics = run_memory_eval(config, logger, checkpoint)
+        knowledge_metrics = run_knowledge_pilot(config, logger, checkpoint)
         if dpo_metrics:
             metrics.update(dpo_metrics)
         if memory_metrics:
             metrics.update(memory_metrics)
+        if knowledge_metrics:
+            metrics.update(knowledge_metrics)
         metrics["evaluation_fingerprint"] = fingerprint
         results.append(metrics)
         cache[checkpoint_name] = metrics
@@ -284,6 +320,11 @@ def run_eval(config: dict[str, Any], logger: Any) -> None:
             lines.append(f"- DPO reward margin: {metrics['reward_margin']:.4f}")
         if "multiturn_memory_n_turn_accuracy" in metrics:
             lines.append(f"- multiturn memory accuracy: {metrics['multiturn_memory_n_turn_accuracy']:.4f}")
+        if "correct_count" in metrics:
+            lines.append(f"- private knowledge pilot correct: {metrics['correct_count']}/{metrics['item_count']}")
+            lines.append(f"- private knowledge pilot accuracy: {metrics['accuracy']:.4f}")
+            lines.append(f"- private knowledge pilot parse rate: {metrics['parse_rate']:.4f}")
+            lines.append(f"- private knowledge pilot passed: {str(metrics['passed']).lower()}")
         lines.append("")
     atomic_write_text(summary_path, "\n".join(lines))
     logger.info(f"Wrote evaluation summary to {summary_path}.")

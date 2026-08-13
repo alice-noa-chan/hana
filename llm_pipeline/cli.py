@@ -62,6 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
     lock_parser.add_argument("--config", default="config.yaml")
     audit_parser = data_subparsers.add_parser("audit", help="Audit approved sources without retaining rejected text")
     audit_parser.add_argument("--config", default="config.yaml")
+    quarantine_parser = data_subparsers.add_parser(
+        "quarantine-eval",
+        help="Add private knowledge-pilot hashes to the benchmark denylist",
+    )
+    quarantine_parser.add_argument("--config", default="config.yaml")
 
     doctor_parser = subparsers.add_parser("doctor", help="Check policy, hardware, storage, and reproducibility")
     doctor_parser.add_argument("--config", default="config.yaml")
@@ -146,6 +151,16 @@ def _dispatch(args: argparse.Namespace) -> None:
             print(
                 f"Audited {scanned:,} samples; category_hits={rejected:,}; digest={report.digest}; "
                 f"output={config['data_policy']['audit_path']}"
+            )
+            return
+        if args.data_command == "quarantine-eval":
+            from .multiple_choice import quarantine_knowledge_pilot
+
+            result = quarantine_knowledge_pilot(config)
+            print(
+                f"Quarantined {result['item_count']} private evaluation items; "
+                f"added_hashes={result['added_hashes']}; total_hashes={result['total_hashes']}; "
+                f"output={result['path']}"
             )
             return
     if args.command == "doctor":

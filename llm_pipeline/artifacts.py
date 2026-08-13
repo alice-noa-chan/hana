@@ -103,6 +103,24 @@ def _file_signature(path: str | Path) -> dict[str, Any]:
     }
 
 
+def _file_content_signature(path: str | Path) -> dict[str, Any]:
+    """Return a content-based signature without retaining any file contents."""
+
+    file_path = Path(path)
+    if not file_path.exists():
+        return {"path": str(file_path), "exists": False}
+    digest = hashlib.sha256()
+    with file_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "path": str(file_path.resolve()),
+        "exists": True,
+        "size": file_path.stat().st_size,
+        "sha256": digest.hexdigest(),
+    }
+
+
 def _expand_paths(values: Iterable[str | Path]) -> list[Path]:
     paths: list[Path] = []
     for value in values:
@@ -315,6 +333,13 @@ def analysis_fingerprint(config: dict[str, Any]) -> str:
 
 def evaluation_fingerprint(config: dict[str, Any], checkpoint: str | Path) -> str:
     dataset_type = checkpoint_dataset_type(checkpoint, config["data"].get("dataset_type", "pretrain"))
+    knowledge_pilot = config["eval"].get("knowledge_pilot", {})
+    knowledge_pilot_file = knowledge_pilot.get("file")
+    knowledge_prompt_file = knowledge_pilot.get("prompt_file")
+    reasoning_prompt_file = config["reasoning"].get("scratchpad_instruction_file")
+    inference_prompt_files = list(config["inference"].get("model_system_prompt_files") or [])
+    if config["inference"].get("user_system_prompt_file"):
+        inference_prompt_files.append(config["inference"]["user_system_prompt_file"])
     payload = {
         "checkpoint": checkpoint_fingerprint(checkpoint),
         "checkpoint_stage": checkpoint_stage(checkpoint),
@@ -328,6 +353,29 @@ def evaluation_fingerprint(config: dict[str, Any], checkpoint: str | Path) -> st
         },
         "assistant_only_loss": config["train"].get("assistant_only_loss"),
         "eval": config["eval"],
+        "knowledge_pilot_file": (_file_content_signature(knowledge_pilot_file) if knowledge_pilot_file else None),
+        "knowledge_prompt_file": (_file_content_signature(knowledge_prompt_file) if knowledge_prompt_file else None),
+        "benchmark_denylist": (
+            _file_content_signature(config["data_policy"]["benchmark_denylist_path"])
+            if config["data_policy"].get("benchmark_denylist_path")
+            else None
+        ),
+        "knowledge_generation": {
+            "protocol_version": 1,
+            "reasoning": config["reasoning"],
+            "reasoning_prompt_file": (
+                _file_content_signature(reasoning_prompt_file) if reasoning_prompt_file else None
+            ),
+            "inference": {
+                "generation_strategy": config["inference"].get("generation_strategy"),
+                "use_kv_cache": config["inference"].get("use_kv_cache"),
+                "model_system_prompt": config["inference"].get("model_system_prompt"),
+                "user_system_prompt": config["inference"].get("user_system_prompt"),
+                "prompt_files": [_file_content_signature(path) for path in _expand_paths(inference_prompt_files)],
+            },
+            "special_tokens": config["tokenizer"].get("special_tokens"),
+            "hybrid_diffusion": config["hybrid_diffusion"],
+        },
     }
     return _fingerprint(payload)
 
@@ -336,6 +384,8 @@ def inference_fingerprint(config: dict[str, Any], checkpoint: str | Path) -> str
     prompt_files = list(config["inference"].get("model_system_prompt_files") or [])
     if config["inference"].get("user_system_prompt_file"):
         prompt_files.append(config["inference"]["user_system_prompt_file"])
+    if config["reasoning"].get("scratchpad_instruction_file"):
+        prompt_files.append(config["reasoning"]["scratchpad_instruction_file"])
     payload = {
         "checkpoint": checkpoint_fingerprint(checkpoint),
         "tokenizer_model": _file_signature(config["tokenizer"]["model_path"]),
@@ -356,6 +406,10 @@ def build_rejects_fingerprint(config: dict[str, Any], checkpoint: str | Path) ->
 
     prompt_sources = config["dpo"].get("prompt_sources") or []
     input_signature = data_signature(config, "sft") if prompt_sources else _file_signature(config["data"]["train_file"])
+    reasoning_prompt_file = config["reasoning"].get("scratchpad_instruction_file")
+    prompt_files = list(config["inference"].get("model_system_prompt_files") or [])
+    if config["inference"].get("user_system_prompt_file"):
+        prompt_files.append(config["inference"]["user_system_prompt_file"])
     return _fingerprint(
         {
             "input": input_signature,
@@ -365,6 +419,19 @@ def build_rejects_fingerprint(config: dict[str, Any], checkpoint: str | Path) ->
             "prompt_field": config["data"]["prompt_field"],
             "chosen_field": config["data"]["chosen_field"],
             "generation": config["dpo"].get("generate_rejected"),
+            "inference": {
+                key: value
+                for key, value in config["inference"].items()
+                if key not in {"model_path", "prompt", "interactive", "token_trace_file"}
+            },
+            "prompt_files": [_file_content_signature(path) for path in _expand_paths(prompt_files)],
+            "reasoning": config["reasoning"],
+            "reasoning_prompt_file": (
+                _file_content_signature(reasoning_prompt_file) if reasoning_prompt_file else None
+            ),
+            "hybrid_diffusion": config["hybrid_diffusion"],
+            "experiments": config["experiments"],
+            "special_tokens": config["tokenizer"].get("special_tokens"),
             "seed": config["run"].get("seed"),
         }
     )

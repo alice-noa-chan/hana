@@ -44,9 +44,11 @@ def test_data_commands_are_part_of_the_public_parser() -> None:
 
     lock = parser.parse_args(["data", "lock", "--config", "x.yaml"])
     audit = parser.parse_args(["data", "audit"])
+    quarantine = parser.parse_args(["data", "quarantine-eval", "--config", "private.yaml"])
 
     assert (lock.command, lock.data_command, lock.config) == ("data", "lock", "x.yaml")
     assert (audit.command, audit.data_command) == ("data", "audit")
+    assert (quarantine.data_command, quarantine.config) == ("quarantine-eval", "private.yaml")
 
 
 def test_experiment_registry_validation_is_public_and_runnable(capsys) -> None:
@@ -129,6 +131,28 @@ def test_data_audit_dispatches_the_auditor(monkeypatch, capsys) -> None:
     assert cli.main(["data", "audit", "--config", "custom.yaml"]) == 0
     assert len(called) == 1
     assert "Audited 3 samples" in capsys.readouterr().out
+
+
+def test_data_quarantine_dispatches_without_printing_items(monkeypatch, capsys) -> None:
+    class Loaded:
+        def mutable_copy(self):
+            return {"eval": {"knowledge_pilot": {}}, "data_policy": {}}
+
+    monkeypatch.setattr("llm_pipeline.config.load_config", lambda _path: Loaded())
+    monkeypatch.setattr(
+        "llm_pipeline.multiple_choice.quarantine_knowledge_pilot",
+        lambda _config: {
+            "item_count": 10,
+            "added_hashes": 20,
+            "total_hashes": 20,
+            "path": "private-denylist.txt",
+        },
+    )
+
+    assert cli.main(["data", "quarantine-eval"]) == 0
+    output = capsys.readouterr().out
+    assert "Quarantined 10 private evaluation items" in output
+    assert "question" not in output
 
 
 def test_doctor_and_transfer_commands_are_part_of_the_public_parser() -> None:
